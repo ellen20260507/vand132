@@ -9,6 +9,8 @@
 #include <QFile>
 #include <QTextStream>
 #include <QApplication>
+#include <QPushButton>
+
 namespace Ui {
 class newdialog;
 }
@@ -21,16 +23,24 @@ public:
     explicit newdialog(QWidget *parent = nullptr);
     ~newdialog();
     QVector<QStringList> getTableData();
+
 private:
     Ui::newdialog *ui;
-    QString getFilePath() const {
-            return qApp->applicationDirPath() + "/poll_config.txt";
-        }
-private slots:
+    static const int kDataColumnCount = 6;
 
+    QString getFilePath() const {
+        return qApp->applicationDirPath() + "/poll_config.txt";
+    }
+
+    void setupDownloadButton(int row);
+    void refreshAllDownloadButtons();
+
+private slots:
     void addRowBtn_clicked();
     void deleteRowBtn_clicked();
     void saveBtn_clicked();
+    void onDownloadClicked();
+    void onExportFinished(int modbusAddr, bool success, const QString& filePath, const QString& errorMessage);
 };
 
 #endif // NEWDIALOG_H

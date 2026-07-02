@@ -1,12 +1,94 @@
 #include "dbmanager.h"
+#include "pollconfig.h"
+
 #include <QDebug>
 #include <QSqlQuery>
 #include <QSqlError>
-#include <QStringBuilder>
 #include <QFile>
 #include <QTextStream>
 #include <QCoreApplication>
 #include <QDir>
+#include <QThread>
+#include <QMetaObject>
+
+namespace {
+
+double parseDisplayNumber(const QString& text, bool* okOut = nullptr)
+{
+    QString s = text.trimmed();
+    s.remove(QStringLiteral("℃"));
+    s.remove(QStringLiteral("%RH"));
+    s.remove(QStringLiteral(" 个"));
+    if (s.isEmpty() || s == QStringLiteral("解析失败") || s == QStringLiteral("无")
+        || s == QStringLiteral("未启用") || s == QStringLiteral("数据不完整")) {
+        if (okOut) {
+            *okOut = false;
+        }
+        return 0.0;
+    }
+    return s.toDouble(okOut);
+}
+
+int parseModbusAddrFromCDeviceId(const QString& deviceId)
+{
+    if (!deviceId.startsWith(QLatin1Char('C')) || deviceId.size() < 2) {
+        return -1;
+    }
+    bool ok = false;
+    const int addr = deviceId.mid(1).toInt(&ok);
+    return ok ? addr : -1;
+}
+
+QString dustPointId(int modbusAddr, const QString& metricKey)
+{
+    return QStringLiteral("C%1_%2").arg(modbusAddr).arg(metricKey);
+}
+
+QList<QPair<QDateTime, double>> queryChannelHistory(QSqlDatabase& db,
+                                                    const QString& channelType,
+                                                    const QString& metricKey,
+                                                    const QDateTime& startTime,
+                                                    const QDateTime& endTime)
+{
+    QList<QPair<QDateTime, double>> result;
+    QSqlQuery query(db);
+    QString sql = R"(
+        SELECT
+            DATE_FORMAT(cr.record_time, '%Y-%m-%d %H:%i:00') AS time_slot,
+            AVG(cr.value_num) AS avg_value
+        FROM channel_reading cr
+        INNER JOIN poll_channel pc ON cr.channel_id = pc.id
+        WHERE cr.record_time >= :startTime AND cr.record_time <= :endTime
+          AND pc.channel_type = :channelType
+          AND cr.value_num IS NOT NULL
+    )";
+
+    if (!metricKey.isEmpty()) {
+        sql += QStringLiteral(" AND pc.metric_key = :metricKey");
+    }
+
+    sql += QStringLiteral(" GROUP BY time_slot ORDER BY time_slot");
+
+    query.prepare(sql);
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+    query.bindValue(QStringLiteral(":channelType"), channelType);
+    if (!metricKey.isEmpty()) {
+        query.bindValue(QStringLiteral(":metricKey"), metricKey);
+    }
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_value")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+} // namespace
 
 DBManager* DBManager::instance()
 {
@@ -14,22 +96,45 @@ DBManager* DBManager::instance()
     return &instance;
 }
 
-DBManager::DBManager(QObject *parent) : QObject(parent), m_isConnected(false)
+DBManager::DBManager(QObject* parent)
+    : QObject(parent)
 {
-    // 初始化线程池
     m_threadPool = new QThreadPool(this);
-    m_threadPool->setMaxThreadCount(4); // 设置最大线程数
+    m_threadPool->setMaxThreadCount(4);
+
+    m_flushTimer = new QTimer(this);
+    m_flushTimer->setInterval(500);
+    connect(m_flushTimer, &QTimer::timeout, this, &DBManager::flushPendingReadings);
 }
 
 DBManager::~DBManager()
 {
+    if (m_flushTimer) {
+        m_flushTimer->stop();
+    }
+
+    {
+        QMutexLocker locker(&m_writeMutex);
+        flushPendingReadingsLocked();
+    }
+
     if (m_threadPool) {
         m_threadPool->clear();
         m_threadPool->waitForDone();
-        delete m_threadPool;
     }
+
     if (m_db.isOpen()) {
         m_db.close();
+    }
+    if (m_readDb.isOpen()) {
+        m_readDb.close();
+    }
+
+    if (QSqlDatabase::contains(QStringLiteral("dbManagerConnection"))) {
+        QSqlDatabase::removeDatabase(QStringLiteral("dbManagerConnection"));
+    }
+    if (QSqlDatabase::contains(QStringLiteral("dbManagerReadConnection"))) {
+        QSqlDatabase::removeDatabase(QStringLiteral("dbManagerReadConnection"));
     }
 }
 
@@ -41,86 +146,103 @@ bool DBManager::initDB(const QString& host, int port, const QString& user, const
     m_password = pwd;
     m_dbName = dbName;
 
-    // 先尝试连接到 MySQL 默认数据库，检查凭证是否正确
-    QSqlDatabase testDb = QSqlDatabase::addDatabase("QMYSQL", "testConnection");
+    QSqlDatabase testDb = QSqlDatabase::addDatabase(QStringLiteral("QMYSQL"), QStringLiteral("testConnection"));
     testDb.setHostName(host);
     testDb.setPort(port);
     testDb.setUserName(user);
     testDb.setPassword(pwd);
-    testDb.setDatabaseName("mysql"); // 使用 mysql 数据库进行测试
-    testDb.setConnectOptions("MYSQL_OPT_CONNECT_TIMEOUT=5");
+    testDb.setDatabaseName(QStringLiteral("mysql"));
+    testDb.setConnectOptions(QStringLiteral("MYSQL_OPT_CONNECT_TIMEOUT=5"));
 
-    emit logGenerated("DBManager", QString("尝试连接到 MySQL: host=%1, port=%2, user=%3").arg(host).arg(port).arg(user));
-
-    // 检查 QMYSQL 驱动是否真的可用
-    emit logGenerated("DBManager", QString("检查 QMYSQL 驱动: %1").arg(testDb.isValid() ? "有效" : "无效"));
-    emit logGenerated("DBManager", QString("数据库驱动类型: %1").arg(testDb.driverName()));
+    emit logGenerated(QStringLiteral("DBManager"),
+                      QStringLiteral("尝试连接到 MySQL: host=%1, port=%2, user=%3").arg(host).arg(port).arg(user));
+    emit logGenerated(QStringLiteral("DBManager"),
+                      QStringLiteral("检查 QMYSQL 驱动: %1").arg(testDb.isValid() ? QStringLiteral("有效") : QStringLiteral("无效")));
+    emit logGenerated(QStringLiteral("DBManager"),
+                      QStringLiteral("数据库驱动类型: %1").arg(testDb.driverName()));
 
     if (!testDb.open()) {
-        QString errorMsg = QString("连接 MySQL 失败: %1").arg(testDb.lastError().text());
+        const QString errorMsg = QStringLiteral("连接 MySQL 失败: %1").arg(testDb.lastError().text());
         qCritical() << errorMsg;
-        emit logGenerated("DBManager", errorMsg);
-        
-        // 分析错误原因
-        QString errorText = testDb.lastError().text();
-        if (errorText.contains("Access denied")) {
-            emit logGenerated("DBManager", "原因分析: 用户凭证错误（用户名或密码不正确）");
-        } else if (errorText.contains("Unknown database")) {
-            emit logGenerated("DBManager", "原因分析: 指定的数据库不存在");
-        } else if (errorText.contains("Can't connect")) {
-            emit logGenerated("DBManager", "原因分析: 无法连接到 MySQL 服务器");
-        } else if (errorText.contains("Driver not loaded")) {
-            emit logGenerated("DBManager", "原因分析: MySQL 驱动加载失败");
-            emit logGenerated("DBManager", "可能的解决方法:");
-            emit logGenerated("DBManager", "1. 确保 libmysql.dll 版本与 MySQL Server 匹配");
-            emit logGenerated("DBManager", "2. 确保程序架构(32位/64位)与 libmysql.dll 匹配");
-            emit logGenerated("DBManager", "3. 检查 qsqlmysql.dll 是否来自正确的 Qt 版本");
-            emit logGenerated("DBManager", "4. 尝试使用 ODBC 连接作为替代方案");
+        emit logGenerated(QStringLiteral("DBManager"), errorMsg);
+
+        const QString errorText = testDb.lastError().text();
+        if (errorText.contains(QStringLiteral("Access denied"))) {
+            emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("原因分析: 用户凭证错误（用户名或密码不正确）"));
+        } else if (errorText.contains(QStringLiteral("Unknown database"))) {
+            emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("原因分析: 指定的数据库不存在"));
+        } else if (errorText.contains(QStringLiteral("Can't connect"))) {
+            emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("原因分析: 无法连接到 MySQL 服务器"));
+        } else if (errorText.contains(QStringLiteral("Driver not loaded"))) {
+            emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("原因分析: MySQL 驱动加载失败"));
         }
-        
+
         testDb.close();
-        QSqlDatabase::removeDatabase("testConnection");
+        QSqlDatabase::removeDatabase(QStringLiteral("testConnection"));
         m_isConnected = false;
         return false;
     }
 
-    emit logGenerated("DBManager", "✓ 成功连接到 MySQL 服务器");
+    emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("✓ 成功连接到 MySQL 服务器"));
     testDb.close();
-    QSqlDatabase::removeDatabase("testConnection");
+    QSqlDatabase::removeDatabase(QStringLiteral("testConnection"));
 
-    // 现在连接到目标数据库
-    m_db = QSqlDatabase::addDatabase("QMYSQL", "dbManagerConnection");
+    if (QSqlDatabase::contains(QStringLiteral("dbManagerConnection"))) {
+        m_db = QSqlDatabase::database(QStringLiteral("dbManagerConnection"));
+        if (m_db.isOpen()) {
+            m_db.close();
+        }
+    } else {
+        m_db = QSqlDatabase::addDatabase(QStringLiteral("QMYSQL"), QStringLiteral("dbManagerConnection"));
+    }
+
     m_db.setHostName(host);
     m_db.setPort(port);
     m_db.setUserName(user);
     m_db.setPassword(pwd);
     m_db.setDatabaseName(dbName);
-    m_db.setConnectOptions("MYSQL_OPT_CONNECT_TIMEOUT=5");
+    m_db.setConnectOptions(QStringLiteral("MYSQL_OPT_CONNECT_TIMEOUT=5"));
 
-    emit logGenerated("DBManager", QString("尝试连接到目标数据库: %1").arg(dbName));
+    emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("尝试连接到目标数据库: %1").arg(dbName));
 
     if (!m_db.open()) {
-        QString errorMsg = QString("连接数据库 %1 失败: %2").arg(dbName).arg(m_db.lastError().text());
+        const QString errorMsg = QStringLiteral("连接数据库 %1 失败: %2").arg(dbName).arg(m_db.lastError().text());
         qCritical() << errorMsg;
-        emit logGenerated("DBManager", errorMsg);
-        
-        if (m_db.lastError().text().contains("Unknown database")) {
-            emit logGenerated("DBManager", QString("原因分析: 数据库 %1 不存在，请先创建").arg(dbName));
-            emit logGenerated("DBManager", QString("可以使用命令: CREATE DATABASE %1;").arg(dbName));
+        emit logGenerated(QStringLiteral("DBManager"), errorMsg);
+
+        if (m_db.lastError().text().contains(QStringLiteral("Unknown database"))) {
+            emit logGenerated(QStringLiteral("DBManager"),
+                              QStringLiteral("原因分析: 数据库 %1 不存在，请先创建").arg(dbName));
+            emit logGenerated(QStringLiteral("DBManager"),
+                              QStringLiteral("可以使用命令: CREATE DATABASE %1;").arg(dbName));
         }
-        
+
         m_isConnected = false;
         return false;
     }
 
     m_isConnected = true;
     qDebug() << "数据库连接成功";
-    emit logGenerated("DBManager", QString("✓ 成功连接到数据库: %1").arg(dbName));
+    emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("✓ 成功连接到数据库: %1").arg(dbName));
 
+    if (!createSchema()) {
+        m_isConnected = false;
+        return false;
+    }
 
-    // 创建报警处理记录表（不存在则创建）
-    QSqlQuery alarmQuery(m_db);
-    QString createAlarmSql = R"(
+    if (!ensureReadConnection()) {
+        emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("只读数据库连接初始化失败"));
+    }
+
+    m_flushTimer->start();
+    return true;
+}
+
+bool DBManager::createSchema()
+{
+    QSqlQuery query(m_db);
+
+    const QString createAlarmSql = R"(
         CREATE TABLE IF NOT EXISTS alarm_handling (
             id INT PRIMARY KEY AUTO_INCREMENT COMMENT '记录ID',
             handle_time DATETIME NOT NULL COMMENT '处理时间',
@@ -131,92 +253,12 @@ bool DBManager::initDB(const QString& host, int port, const QString& user, const
             INDEX idx_handler (handler)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '报警处理记录表';
     )";
-    if (!alarmQuery.exec(createAlarmSql)) {
-        qCritical() << "创建报警处理记录表失败：" << alarmQuery.lastError().text();
+    if (!query.exec(createAlarmSql)) {
+        qCritical() << "创建报警处理记录表失败：" << query.lastError().text();
+        return false;
     }
 
-    // 创建设备表（不存在则创建）
-    QSqlQuery deviceQuery(m_db);
-    QString createDeviceSql = R"(
-        CREATE TABLE IF NOT EXISTS devices (
-            id INT PRIMARY KEY AUTO_INCREMENT,
-            device_id VARCHAR(20) NOT NULL UNIQUE,
-            device_type VARCHAR(10) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_device_id (device_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '设备表';
-    )";
-    if (!deviceQuery.exec(createDeviceSql)) {
-        qCritical() << "创建设备表失败：" << deviceQuery.lastError().text();
-    }
-
-    // 创建W设备数据表（不存在则创建）
-    QSqlQuery wQuery(m_db);
-    QString createWSql = R"(
-        CREATE TABLE IF NOT EXISTS w_data (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            device_id VARCHAR(20) NOT NULL,
-            value DOUBLE NOT NULL,
-            time DATETIME NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_device_time (device_id, time)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT 'W设备数据表';
-    )";
-    if (!wQuery.exec(createWSql)) {
-        qCritical() << "创建W设备数据表失败：" << wQuery.lastError().text();
-    }
-
-    // 创建T设备数据表（不存在则创建）
-    QSqlQuery tQuery(m_db);
-    QString createTSql = R"(
-        CREATE TABLE IF NOT EXISTS t_data (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            device_id VARCHAR(20) NOT NULL,
-            value DOUBLE NOT NULL,
-            time DATETIME NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_device_time (device_id, time)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT 'T设备数据表';
-    )";
-    if (!tQuery.exec(createTSql)) {
-        qCritical() << "创建T设备数据表失败：" << tQuery.lastError().text();
-    }
-
-    // 创建E设备数据表（不存在则创建）
-    QSqlQuery eQuery(m_db);
-    QString createESql = R"(
-        CREATE TABLE IF NOT EXISTS e_data (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            device_id VARCHAR(20) NOT NULL,
-            value DOUBLE NOT NULL,
-            time DATETIME NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_device_time (device_id, time)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT 'E设备数据表';
-    )";
-    if (!eQuery.exec(createESql)) {
-        qCritical() << "创建E设备数据表失败：" << eQuery.lastError().text();
-    }
-
-    // 创建尘埃数据表（不存在则创建）
-    QSqlQuery dustQuery(m_db);
-    QString createDustSql = R"(
-        CREATE TABLE IF NOT EXISTS dust_data (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            index_id INT NOT NULL,
-            value DOUBLE NOT NULL,
-            time DATETIME NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_index_time (index_id, time)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '尘埃数据表';
-    )";
-    if (!dustQuery.exec(createDustSql)) {
-        qCritical() << "创建尘埃数据表失败：" << dustQuery.lastError().text();
-    }
-
-    // 创建合格率数据表（不存在则创建）
-    QSqlQuery rateQuery(m_db);
-    QString createRateSql = R"(
+    const QString createRateSql = R"(
         CREATE TABLE IF NOT EXISTS qualified_rate (
             id INT PRIMARY KEY AUTO_INCREMENT,
             time DATETIME NOT NULL,
@@ -230,1143 +272,153 @@ bool DBManager::initDB(const QString& host, int port, const QString& user, const
             INDEX idx_time (time)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '合格率数据表';
     )";
-    if (!rateQuery.exec(createRateSql)) {
-        qCritical() << "创建合格率数据表失败：" << rateQuery.lastError().text();
-    }
-
-    return true;
-}
-
-bool DBManager::addDevice(const QString& devId, const QString& devType)
-{
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
+    if (!query.exec(createRateSql)) {
+        qCritical() << "创建合格率数据表失败：" << query.lastError().text();
         return false;
     }
 
-    QSqlQuery query(m_db);
-
-    if (deviceExists(devId)) {
-        return true; // 设备已存在
-    }
-
-    query.prepare("INSERT INTO devices (device_id, device_type) VALUES (:devId, :devType)");
-    query.bindValue(":devId", devId);
-    query.bindValue(":devType", devType);
-
-    if (!query.exec()) {
-        qCritical() << "添加设备失败：" << query.lastError().text();
+    const QString createPollDeviceSql = R"(
+        CREATE TABLE IF NOT EXISTS poll_device (
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            modbus_addr INT NOT NULL,
+            device_label VARCHAR(64) NULL,
+            w_config VARCHAR(64) NULL,
+            t_config VARCHAR(64) NULL,
+            e_config VARCHAR(64) NULL,
+            c_config VARCHAR(64) NULL,
+            i_config VARCHAR(64) NULL,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uk_modbus_addr (modbus_addr)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '轮询设备配置表';
+    )";
+    if (!query.exec(createPollDeviceSql)) {
+        qCritical() << "创建 poll_device 表失败：" << query.lastError().text();
         return false;
     }
 
-    return true;
-}
-
-bool DBManager::deviceExists(const QString& devId)
-{
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
+    const QString createPollChannelSql = R"(
+        CREATE TABLE IF NOT EXISTS poll_channel (
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            device_id INT NOT NULL,
+            channel_type CHAR(1) NOT NULL,
+            channel_no INT NOT NULL,
+            point_id VARCHAR(64) NOT NULL,
+            metric_key VARCHAR(32) NULL,
+            start_register INT NOT NULL DEFAULT 0,
+            register_count INT NOT NULL DEFAULT 1,
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            UNIQUE KEY uk_point_id (point_id),
+            INDEX idx_device_id (device_id),
+            CONSTRAINT fk_poll_channel_device FOREIGN KEY (device_id)
+                REFERENCES poll_device(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '轮询通道配置表';
+    )";
+    if (!query.exec(createPollChannelSql)) {
+        qCritical() << "创建 poll_channel 表失败：" << query.lastError().text();
         return false;
     }
 
-    QSqlQuery query(m_db);
-    query.prepare("SELECT COUNT(*) FROM devices WHERE device_id = :devId");
-    query.bindValue(":devId", devId);
-
-    if (!query.exec()) {
-        qCritical() << "查询设备是否存在失败：" << query.lastError().text();
-        return false;
-    }
-
-    if (query.next()) {
-        return query.value(0).toInt() > 0;
-    }
-
-    return false;
-}
-
-bool DBManager::insertData(const QString& devId, double parsedValue)
-{
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return false;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 确定设备类型对应的表
-    QString tableName;
-    if (devId.startsWith("W")) {
-        tableName = "w_data";
-    } else if (devId.startsWith("T")) {
-        tableName = "t_data";
-    } else if (devId.startsWith("E")) {
-        tableName = "e_data";
-    } else {
-        return false; // 未知设备类型
-    }
-
-    // 检查设备是否存在，不存在则添加
-    if (!deviceExists(devId)) {
-        QString devType = devId.left(1); // 取首字母作为设备类型
-        if (!addDevice(devId, devType)) {
-            return false;
-        }
-    }
-
-    // 插入数据
-    query.prepare(QString("INSERT INTO %1 (device_id, value, time) VALUES (:devId, :value, NOW())").arg(tableName));
-    query.bindValue(":devId", devId);
-    query.bindValue(":value", parsedValue);
-
-    if (!query.exec()) {
-        qCritical() << "插入数据失败：" << query.lastError().text();
+    const QString createChannelReadingSql = R"(
+        CREATE TABLE IF NOT EXISTS channel_reading (
+            id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            channel_id INT NOT NULL,
+            device_id INT NOT NULL,
+            record_time DATETIME(3) NOT NULL,
+            value_num DOUBLE NULL,
+            value_raw VARCHAR(64) NULL,
+            status VARCHAR(16) NULL,
+            status_desc VARCHAR(64) NULL,
+            INDEX idx_device_time (device_id, record_time),
+            INDEX idx_channel_time (channel_id, record_time),
+            CONSTRAINT fk_channel_reading_channel FOREIGN KEY (channel_id)
+                REFERENCES poll_channel(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT '通道读数表';
+    )";
+    if (!query.exec(createChannelReadingSql)) {
+        qCritical() << "创建 channel_reading 表失败：" << query.lastError().text();
         return false;
     }
 
     return true;
 }
 
-bool DBManager::insertDustData(const QString& devId, const QString& indexId, double parsedValue)
+bool DBManager::ensureReadConnection()
 {
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return false;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 检查设备是否存在，不存在则添加
-    if (!deviceExists(devId)) {
-        if (!addDevice(devId, "C")) {
-            return false;
+    if (m_isConnected && m_readDb.isOpen()) {
+        QSqlQuery testQuery(m_readDb);
+        if (testQuery.exec(QStringLiteral("SELECT 1"))) {
+            return true;
         }
     }
 
-    // 插入数据
-    query.prepare("INSERT INTO dust_data (device_id, index_id, value, time) VALUES (:devId, :indexId, :value, NOW())");
-    query.bindValue(":devId", devId);
-    query.bindValue(":indexId", indexId);
-    query.bindValue(":value", parsedValue);
-
-    if (!query.exec()) {
-        qCritical() << "插入尘埃数据失败：" << query.lastError().text();
-        return false;
-    }
-
-    return true;
-}
-
-bool DBManager::insertIonFanData(const QString& devId, const QString& status1, const QString& status2)
-{
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return false;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 检查设备是否存在，不存在则添加
-    if (!deviceExists(devId)) {
-        if (!addDevice(devId, "I")) {
-            return false;
-        }
-    }
-
-    // 插入数据
-    query.prepare("INSERT INTO ion_fan_data (device_id, status1, status2, time) VALUES (:devId, :status1, :status2, NOW())");
-    query.bindValue(":devId", devId);
-    query.bindValue(":status1", status1);
-    query.bindValue(":status2", status2);
-
-    if (!query.exec()) {
-        qCritical() << "插入离子风机数据失败：" << query.lastError().text();
-        return false;
-    }
-
-    return true;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getDustHistoryData(const QString& indexId, const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(value) as avg_value
-        FROM dust_data
-        WHERE index_id = :indexId AND time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":indexId", indexId);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
+    if (QSqlDatabase::contains(QStringLiteral("dbManagerReadConnection"))) {
+        m_readDb = QSqlDatabase::database(QStringLiteral("dbManagerReadConnection"));
+        if (m_readDb.isOpen()) {
+            m_readDb.close();
         }
     } else {
-        qCritical() << "查询尘埃历史数据失败：" << query.lastError().text();
+        m_readDb = QSqlDatabase::addDatabase(QStringLiteral("QMYSQL"), QStringLiteral("dbManagerReadConnection"));
     }
 
-    return result;
+    m_readDb.setHostName(m_host);
+    m_readDb.setPort(m_port);
+    m_readDb.setUserName(m_user);
+    m_readDb.setPassword(m_password);
+    m_readDb.setDatabaseName(m_dbName);
+    m_readDb.setConnectOptions(QStringLiteral("MYSQL_OPT_CONNECT_TIMEOUT=5"));
+
+    return m_readDb.open();
 }
 
-QList<QPair<QDateTime, double>> DBManager::getWHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(value) as avg_value
-        FROM w_data
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询W设备历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getTHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(value) as avg_value
-        FROM t_data
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询T设备历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getEHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(value) as avg_value
-        FROM e_data
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询E设备历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG((w_qualified_rate + t_qualified_rate + e_qualified_rate) / 3) as avg_rate
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_rate").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询合格率历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getWQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(w_qualified_rate) as avg_rate
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_rate").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询W设备合格率历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getTQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(t_qualified_rate) as avg_rate
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_rate").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询T设备合格率历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getEQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(e_qualified_rate) as avg_rate
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_rate").toDouble();
-            result.append(qMakePair(time, value));
-        }
-    } else {
-        qCritical() << "查询E设备合格率历史数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getTempHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 发送查询开始日志
-    QString logMessage = QString("查询温度历史数据：开始时间=%1, 结束时间=%2, 间隔=%3分钟").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss")).arg(intervalMinutes);
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        QString errorLog = "数据库连接失败，无法查询温度历史数据";
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(avg_temperature) as avg_value
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-    query.bindValue(":interval", intervalMinutes);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-        QString successLog = QString("温度历史数据查询成功，共获取%1条数据").arg(result.size());
-        emit logGenerated("DBManager", successLog);
-        writeLogToFile("DBManager", successLog);
-    } else {
-        QString errorLog = QString("查询温度历史数据失败：%1").arg(query.lastError().text());
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        qCritical() << errorLog;
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getHumidityHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 发送查询开始日志
-    QString logMessage = QString("查询湿度历史数据：开始时间=%1, 结束时间=%2, 间隔=%3分钟").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss")).arg(intervalMinutes);
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        QString errorLog = "数据库连接失败，无法查询湿度历史数据";
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(avg_humidity) as avg_value
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-    query.bindValue(":interval", intervalMinutes);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-        QString successLog = QString("湿度历史数据查询成功，共获取%1条数据").arg(result.size());
-        emit logGenerated("DBManager", successLog);
-        writeLogToFile("DBManager", successLog);
-    } else {
-        QString errorLog = QString("查询湿度历史数据失败：%1").arg(query.lastError().text());
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        qCritical() << errorLog;
-    }
-
-    return result;
-}
-
-QList<QPair<QDateTime, double>> DBManager::getCleanlinessHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-{
-    QList<QPair<QDateTime, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 发送查询开始日志
-    QString logMessage = QString("查询洁净度历史数据：开始时间=%1, 结束时间=%2, 间隔=%3分钟").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss")).arg(intervalMinutes);
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        QString errorLog = "数据库连接失败，无法查询洁净度历史数据";
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 构建SQL查询，按时间间隔分组并计算平均值
-    QString sql = R"(
-        SELECT
-            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') as time_slot,
-            AVG(avg_cleanliness) as avg_value
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        GROUP BY time_slot
-        ORDER BY time_slot
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-    query.bindValue(":interval", intervalMinutes);
-
-    if (query.exec()) {
-        while (query.next()) {
-            QDateTime time = QDateTime::fromString(query.value("time_slot").toString(), "yyyy-MM-dd HH:mm:ss");
-            double value = query.value("avg_value").toDouble();
-            result.append(qMakePair(time, value));
-        }
-        QString successLog = QString("洁净度历史数据查询成功，共获取%1条数据").arg(result.size());
-        emit logGenerated("DBManager", successLog);
-        writeLogToFile("DBManager", successLog);
-    } else {
-        QString errorLog = QString("查询洁净度历史数据失败：%1").arg(query.lastError().text());
-        emit logGenerated("DBManager", errorLog);
-        writeLogToFile("DBManager", errorLog);
-        qCritical() << errorLog;
-    }
-
-    return result;
-}
-
-QMap<QDateTime, QMap<QString, double>> DBManager::getHistoryChartData()
-{
-    QMap<QDateTime, QMap<QString, double>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 计算开始时间（24小时前）
-    QDateTime endTime = QDateTime::currentDateTime();
-    QDateTime startTime = endTime.addDays(-1);
-
-    // 发送查询开始日志到textBrowser
-    QString logMessage = QString("数据库已开始查询历史图表数据：开始时间=%1, 结束时间=%2").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss"));
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 构建SQL查询
-    QString sql = R"(
-        SELECT
-            time,
-            w_qualified_rate,
-            t_qualified_rate,
-            e_qualified_rate,
-            avg_temperature,
-            avg_humidity,
-            avg_cleanliness
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        ORDER BY time
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        // 存储所有数据点
-        QList<QPair<QDateTime, QMap<QString, double>>> allData;
-
-        while (query.next()) {
-            QDateTime time = query.value("time").toDateTime();
-            double wRate = query.value("w_qualified_rate").toDouble();
-            double tRate = query.value("t_qualified_rate").toDouble();
-            double eRate = query.value("e_qualified_rate").toDouble();
-            double avgTemp = query.value("avg_temperature").toDouble();
-            double avgHumidity = query.value("avg_humidity").toDouble();
-            double avgCleanliness = query.value("avg_cleanliness").toDouble();
-
-            QMap<QString, double> dataMap;
-            dataMap["腕带合格率"] = wRate;
-            dataMap["台垫合格率"] = tRate;
-            dataMap["设备合格率"] = eRate;
-            dataMap["平均温度"] = avgTemp;
-            dataMap["平均湿度"] = avgHumidity;
-            dataMap["平均洁净度"] = avgCleanliness;
-            allData.append(qMakePair(time, dataMap));
-        }
-
-        // 每隔5个时间点取一个数据
-        for (int i = 0; i < allData.size(); i += 5) {
-            result[allData[i].first] = allData[i].second;
-        }
-
-        // 确保至少有一个数据点
-        if (result.isEmpty() && !allData.isEmpty()) {
-            result[allData.last().first] = allData.last().second;
-        }
-    } else {
-        qCritical() << "查询历史图表数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QJsonObject DBManager::getHistoryChartData(const QString& timeRange)
-{
-    QJsonObject result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    // 根据时间范围计算开始时间
-    QDateTime endTime = QDateTime::currentDateTime();
-    QDateTime startTime;
-
-    if (timeRange == "1h") {
-        startTime = endTime.addSecs(-1 * 60 * 60); // 1小时 = 3600秒
-    } else if (timeRange == "24h") {
-        startTime = endTime.addDays(-1);
-    } else if (timeRange == "7d") {
-        startTime = endTime.addDays(-7);
-    } else {
-        // 默认24小时
-        startTime = endTime.addDays(-1);
-    }
-
-    // 发送查询开始日志到textBrowser
-    QString logMessage = QString("数据库已开始查询历史图表数据：时间范围=%1, 开始时间=%2, 结束时间=%3").arg(timeRange).arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss"));
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 查询合格表率和环境数据
-    QString sql = R"(
-        SELECT
-            time,
-            w_qualified_rate,
-            t_qualified_rate,
-            e_qualified_rate,
-            avg_temperature,
-            avg_humidity,
-            avg_cleanliness
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-        ORDER BY time
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        // 存储所有数据点
-        QJsonArray timeArray;
-        QJsonArray wRateArray;
-        QJsonArray tRateArray;
-        QJsonArray eRateArray;
-        QJsonArray tempArray;
-        QJsonArray humidityArray;
-        QJsonArray cleanlinessArray;
-
-        // 计算平均值
-        double totalWRate = 0.0;
-        double totalTRate = 0.0;
-        double totalERate = 0.0;
-        double totalTemp = 0.0;
-        double totalHumidity = 0.0;
-        double totalCleanliness = 0.0;
-        int count = 0;
-
-        while (query.next()) {
-            QDateTime time = query.value("time").toDateTime();
-            double wRate = query.value("w_qualified_rate").toDouble();
-            double tRate = query.value("t_qualified_rate").toDouble();
-            double eRate = query.value("e_qualified_rate").toDouble();
-            double temp = query.value("avg_temperature").toDouble();
-            double humidity = query.value("avg_humidity").toDouble();
-            double cleanliness = query.value("avg_cleanliness").toDouble();
-
-            // 累加计算
-            totalWRate += wRate;
-            totalTRate += tRate;
-            totalERate += eRate;
-            totalTemp += temp;
-            totalHumidity += humidity;
-            totalCleanliness += cleanliness;
-            count++;
-
-            timeArray.append(time.toString("yyyy-MM-dd HH:mm:ss"));
-            wRateArray.append(wRate);
-            tRateArray.append(tRate);
-            eRateArray.append(eRate);
-            tempArray.append(temp);
-            humidityArray.append(humidity);
-            cleanlinessArray.append(cleanliness);
-        }
-
-        // 计算平均值
-        double avgWRate = count > 0 ? totalWRate / count : 0.0;
-        double avgTRate = count > 0 ? totalTRate / count : 0.0;
-        double avgERate = count > 0 ? totalERate / count : 0.0;
-        double avgTemp = count > 0 ? totalTemp / count : 0.0;
-        double avgHumidity = count > 0 ? totalHumidity / count : 0.0;
-        double avgCleanliness = count > 0 ? totalCleanliness / count : 0.0;
-
-        // 构建结果对象
-        result["time"] = timeArray;
-        result["wRate"] = wRateArray;
-        result["tRate"] = tRateArray;
-        result["eRate"] = eRateArray;
-        result["temperature"] = tempArray;
-        result["humidity"] = humidityArray;
-        result["cleanliness"] = cleanlinessArray;
-
-        // 输出计算结果到日志
-        qDebug() << QString("历史数据计算结果：时间范围=%1, 数据点数=%2, 腕带合格率平均值=%3%, 台垫合格率平均值=%4%, 设备合格率平均值=%5%, 平均温度=%6℃, 平均湿度=%7%RH, 平均洁净度=%8")
-            .arg(timeRange)
-            .arg(count)
-            .arg(QString::number(avgWRate, 'f', 2))
-            .arg(QString::number(avgTRate, 'f', 2))
-            .arg(QString::number(avgERate, 'f', 2))
-            .arg(QString::number(avgTemp, 'f', 1))
-            .arg(QString::number(avgHumidity, 'f', 1))
-            .arg(QString::number(avgCleanliness, 'f', 0));
-
-        // 发送计算结果到textBrowser
-        QString logMessage = QString("历史数据计算结果：时间范围=%1, 数据点数=%2, 腕带合格率平均值=%3%, 台垫合格率平均值=%4%, 设备合格率平均值=%5%, 平均温度=%6℃, 平均湿度=%7%RH, 平均洁净度=%8")
-            .arg(timeRange)
-            .arg(count)
-            .arg(QString::number(avgWRate, 'f', 2))
-            .arg(QString::number(avgTRate, 'f', 2))
-            .arg(QString::number(avgERate, 'f', 2))
-            .arg(QString::number(avgTemp, 'f', 1))
-            .arg(QString::number(avgHumidity, 'f', 1))
-            .arg(QString::number(avgCleanliness, 'f', 0));
-        emit logGenerated("DBManager", logMessage);
-        writeLogToFile("DBManager", logMessage);
-    } else {
-        qCritical() << "查询历史图表数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-QVector<double> DBManager::getAverageDataFromTimeRange(const QDateTime& startTime, int minutesRange)
-{
-    QVector<double> result(6, 0.0); // 0: w合格率, 1: t合格率, 2: e合格率, 3: 平均温度, 4: 平均湿度, 5: 平均洁净度
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-
-    QDateTime endTime = startTime.addSecs(minutesRange * 60);
-
-    // 发送查询开始日志到textBrowser
-    QString logMessage = QString("数据库已开始查询时间范围平均数据：开始时间=%1, 结束时间=%2").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss"));
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 查询指定时间范围内的平均值
-    QString sql = R"(
-        SELECT
-            AVG(w_qualified_rate) as avg_w_rate,
-            AVG(t_qualified_rate) as avg_t_rate,
-            AVG(e_qualified_rate) as avg_e_rate,
-            AVG(avg_temperature) as avg_temp,
-            AVG(avg_humidity) as avg_humidity,
-            AVG(avg_cleanliness) as avg_cleanliness
-        FROM qualified_rate
-        WHERE time >= :startTime AND time <= :endTime
-    )";
-
-    query.prepare(sql);
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
-
-    if (query.exec()) {
-        if (query.next()) {
-            result[0] = query.value("avg_w_rate").toDouble();
-            result[1] = query.value("avg_t_rate").toDouble();
-            result[2] = query.value("avg_e_rate").toDouble();
-            result[3] = query.value("avg_temp").toDouble();
-            result[4] = query.value("avg_humidity").toDouble();
-            result[5] = query.value("avg_cleanliness").toDouble();
-
-            // 发送计算结果到textBrowser
-            QString logMessage = QString("时间范围计算结果：开始时间=%1, 结束时间=%2, 腕带合格率平均值=%3%%, 台垫合格率平均值=%4%%, 设备合格率平均值=%5%%, 平均温度=%6℃, 平均湿度=%7%%RH, 平均洁净度=%8").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss")).arg(result[0], 0, 'f', 2).arg(result[1], 0, 'f', 2).arg(result[2], 0, 'f', 2).arg(result[3], 0, 'f', 1).arg(result[4], 0, 'f', 1).arg(result[5], 0, 'f', 0);
-            emit logGenerated("DBManager", logMessage);
-            writeLogToFile("DBManager", logMessage);
-        } else {
-            // 没有数据返回
-            QString logMessage = QString("查询时间范围平均数据：没有找到数据，开始时间=%1, 结束时间=%2").arg(startTime.toString("yyyy-MM-dd HH:mm:ss")).arg(endTime.toString("yyyy-MM-dd HH:mm:ss"));
-            emit logGenerated("DBManager", logMessage);
-            writeLogToFile("DBManager", logMessage);
-            qCritical() << "查询时间范围平均数据：没有找到数据";
-        }
-    } else {
-        // 查询执行失败
-        QString logMessage = QString("查询时间范围平均数据失败：%1").arg(query.lastError().text());
-        emit logGenerated("DBManager", logMessage);
-        writeLogToFile("DBManager", logMessage);
-        qCritical() << "查询时间范围平均数据失败：" << query.lastError().text();
-    }
-
-    return result;
-}
-
-// 获取最近一次轮询的统计数据（用于计算合格率）
-QMap<QString, QPair<int, int>> DBManager::getPollingStatistics(const QDateTime& time, int minutesRange)
-{
-    QMap<QString, QPair<int, int>> result;
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    QSqlQuery query(m_db);
-    QDateTime startTime = time.addSecs(-minutesRange * 60);
-
-    // 查询W设备统计
-    query.prepare(R"(
-        SELECT
-            COUNT(*) as total_count,
-            SUM(CASE WHEN status = '1' THEN 1 ELSE 0 END) as qualified_count
-        FROM w_data
-        WHERE time >= :startTime AND time <= :endTime
-    )");
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", time);
-
-    if (query.exec() && query.next()) {
-        int total = query.value("total_count").toInt();
-        int qualified = query.value("qualified_count").toInt();
-        result["W"] = qMakePair(total, qualified);
-    }
-
-    // 查询T设备统计
-    query.prepare(R"(
-        SELECT
-            COUNT(*) as total_count,
-            SUM(CASE WHEN status = '1' THEN 1 ELSE 0 END) as qualified_count
-        FROM t_data
-        WHERE time >= :startTime AND time <= :endTime
-    )");
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", time);
-
-    if (query.exec() && query.next()) {
-        int total = query.value("total_count").toInt();
-        int qualified = query.value("qualified_count").toInt();
-        result["T"] = qMakePair(total, qualified);
-    }
-
-    // 查询E设备统计
-    query.prepare(R"(
-        SELECT
-            COUNT(*) as total_count,
-            SUM(CASE WHEN status = '1' THEN 1 ELSE 0 END) as qualified_count
-        FROM e_data
-        WHERE time >= :startTime AND time <= :endTime
-    )");
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", time);
-
-    if (query.exec() && query.next()) {
-        int total = query.value("total_count").toInt();
-        int qualified = query.value("qualified_count").toInt();
-        result["E"] = qMakePair(total, qualified);
-    }
-
-    return result;
-}
-
-// 获取最近一次轮询的平均环境数据（温度、湿度、洁净度）
-QVector<double> DBManager::getPollingEnvData(const QDateTime& time, int minutesRange)
-{
-    QVector<double> result(3, 0.0); // 0: 平均温度, 1: 平均湿度, 2: 平均洁净度
-
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
-        return result;
-    }
-
-    // 暂时返回默认值，不查询dust_data表的数据
-    // 后续可以根据需要从qualified_rate表查询历史数据进行统计
-    
-    // 返回默认值：温度=0, 湿度=0, 洁净度=0
-    result[0] = 0.0; // 温度
-    result[1] = 0.0; // 湿度
-    result[2] = 0.0; // 洁净度
-
-    return result;
-}
-
-// AsyncQueryTask 类的实现
-DBManager::AsyncQueryTask::AsyncQueryTask(DBManager* manager, QueryType type, const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes)
-    : m_manager(manager), m_type(type), m_startTime(startTime), m_endTime(endTime), m_intervalMinutes(intervalMinutes), m_minutesRange(0)
-{
-    setAutoDelete(true);
-}
-
-DBManager::AsyncQueryTask::AsyncQueryTask(DBManager* manager, const QDateTime& startTime, int minutesRange)
-    : m_manager(manager), m_type(AverageData), m_startTime(startTime), m_endTime(QDateTime()), m_intervalMinutes(0), m_minutesRange(minutesRange)
-{
-    setAutoDelete(true);
-}
-
-void DBManager::AsyncQueryTask::run()
-{
-    switch (m_type) {
-    case TempHistory: {
-        QList<QPair<QDateTime, double>> data = m_manager->getTempHistoryData(m_startTime, m_endTime, m_intervalMinutes);
-        emit m_manager->tempHistoryDataReady(data);
-        break;
-    }
-    case HumidityHistory: {
-        QList<QPair<QDateTime, double>> data = m_manager->getHumidityHistoryData(m_startTime, m_endTime, m_intervalMinutes);
-        emit m_manager->humidityHistoryDataReady(data);
-        break;
-    }
-    case CleanlinessHistory: {
-        QList<QPair<QDateTime, double>> data = m_manager->getCleanlinessHistoryData(m_startTime, m_endTime, m_intervalMinutes);
-        emit m_manager->cleanlinessHistoryDataReady(data);
-        break;
-    }
-    case AverageData: {
-        QVector<double> data = m_manager->getAverageDataFromTimeRange(m_startTime, m_minutesRange);
-        emit m_manager->averageDataReady(data);
-        break;
-    }
-    }
-}
-
-// 检查并重新连接数据库
 bool DBManager::checkAndReconnect()
 {
-    // 先检查连接状态
     if (m_isConnected && m_db.isOpen()) {
-        // 测试连接是否有效
         QSqlQuery testQuery(m_db);
-        if (testQuery.exec("SELECT 1")) {
-            return true; // 连接正常，直接返回
+        if (testQuery.exec(QStringLiteral("SELECT 1"))) {
+            return true;
         }
     }
 
-    // 连接异常，尝试重新连接（最多重试3次）
-    const int MAX_RETRY = 3;
-    for (int retry = 0; retry < MAX_RETRY; retry++) {
-        qDebug() << "数据库连接异常，尝试重新连接... (尝试" << retry + 1 << "/" << MAX_RETRY << ")";
-        QString logMessage = QString("数据库连接异常，尝试重新连接... (尝试%1/%2)").arg(retry + 1).arg(MAX_RETRY);
-        emit logGenerated("DBManager", logMessage);
-        writeLogToFile("DBManager", logMessage);
+    const int maxRetry = 3;
+    for (int retry = 0; retry < maxRetry; ++retry) {
+        QString logMessage = QStringLiteral("数据库连接异常，尝试重新连接... (尝试%1/%2)")
+                                 .arg(retry + 1)
+                                 .arg(maxRetry);
+        emit logGenerated(QStringLiteral("DBManager"), logMessage);
+        writeLogToFile(QStringLiteral("DBManager"), logMessage);
 
-        // 关闭旧连接
         if (m_db.isOpen()) {
             m_db.close();
         }
 
-        // 重新初始化数据库连接
-        m_db = QSqlDatabase::addDatabase("QMYSQL", "dbManagerConnection");
+        if (QSqlDatabase::contains(QStringLiteral("dbManagerConnection"))) {
+            m_db = QSqlDatabase::database(QStringLiteral("dbManagerConnection"));
+        } else {
+            m_db = QSqlDatabase::addDatabase(QStringLiteral("QMYSQL"), QStringLiteral("dbManagerConnection"));
+        }
+
         m_db.setHostName(m_host);
         m_db.setPort(m_port);
         m_db.setUserName(m_user);
         m_db.setPassword(m_password);
         m_db.setDatabaseName(m_dbName);
-        m_db.setConnectOptions("MYSQL_OPT_CONNECT_TIMEOUT=5");
+        m_db.setConnectOptions(QStringLiteral("MYSQL_OPT_CONNECT_TIMEOUT=5"));
 
         if (m_db.open()) {
             m_isConnected = true;
-            logMessage = "数据库重新连接成功";
-            emit logGenerated("DBManager", logMessage);
-            writeLogToFile("DBManager", logMessage);
+            logMessage = QStringLiteral("数据库重新连接成功");
+            emit logGenerated(QStringLiteral("DBManager"), logMessage);
+            writeLogToFile(QStringLiteral("DBManager"), logMessage);
             return true;
-        } else {
-            logMessage = "数据库重新连接失败：" + m_db.lastError().text();
-            emit logGenerated("DBManager", logMessage);
-            writeLogToFile("DBManager", logMessage);
+        }
 
-            // 重试间隔
-            if (retry < MAX_RETRY - 1) {
-                QThread::msleep(1000); // 等待1秒后重试
-            }
+        logMessage = QStringLiteral("数据库重新连接失败：") + m_db.lastError().text();
+        emit logGenerated(QStringLiteral("DBManager"), logMessage);
+        writeLogToFile(QStringLiteral("DBManager"), logMessage);
+
+        if (retry < maxRetry - 1) {
+            QThread::msleep(1000);
         }
     }
 
@@ -1374,121 +426,445 @@ bool DBManager::checkAndReconnect()
     return false;
 }
 
-// W/T/E数据插入（完整数据：标识+时间+值+状态+状态描述）
-bool DBManager::insertWteData(const QString& deviceType, const QString& deviceId,
-                             const QDateTime& recordTime, uint32_t value,
-                             const QString& status, const QString& statusDesc)
+bool DBManager::syncPollConfigFromRows(const QVector<QStringList>& rows)
 {
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
+    QMutexLocker locker(&m_writeMutex);
     if (!checkAndReconnect()) {
         return false;
     }
 
+    m_pointChannelIds.clear();
+    m_pointDeviceIds.clear();
+
     QSqlQuery query(m_db);
 
-    // 确定设备类型对应的表
-    QString tableName;
-    if (deviceType == "W") {
-        tableName = "w_data";
-    } else if (deviceType == "T") {
-        tableName = "t_data";
-    } else if (deviceType == "E") {
-        tableName = "e_data";
-    } else {
-        return false; // 未知设备类型
-    }
+    for (const QStringList& row : rows) {
+        if (row.isEmpty()) {
+            continue;
+        }
 
-    // 检查设备是否存在，不存在则添加
-    if (!deviceExists(deviceId)) {
-        if (!addDevice(deviceId, deviceType)) {
+        bool addrOk = false;
+        const int modbusAddr = row[0].toInt(&addrOk);
+        if (!addrOk || modbusAddr <= 0) {
+            continue;
+        }
+
+        const QString wConfig = row.size() > 1 ? row[1].trimmed() : QString();
+        const QString tConfig = row.size() > 2 ? row[2].trimmed() : QString();
+        const QString eConfig = row.size() > 3 ? row[3].trimmed() : QString();
+        const QString cConfig = row.size() > 4 ? row[4].trimmed() : QString();
+        const QString iConfig = row.size() > 5 ? row[5].trimmed() : QString();
+
+        query.prepare(R"(
+            INSERT INTO poll_device (modbus_addr, device_label, w_config, t_config, e_config, c_config, i_config, enabled)
+            VALUES (:modbusAddr, :deviceLabel, :wConfig, :tConfig, :eConfig, :cConfig, :iConfig, 1)
+            ON DUPLICATE KEY UPDATE
+                device_label = VALUES(device_label),
+                w_config = VALUES(w_config),
+                t_config = VALUES(t_config),
+                e_config = VALUES(e_config),
+                c_config = VALUES(c_config),
+                i_config = VALUES(i_config),
+                enabled = 1,
+                updated_at = CURRENT_TIMESTAMP
+        )");
+        query.bindValue(QStringLiteral(":modbusAddr"), modbusAddr);
+        query.bindValue(QStringLiteral(":deviceLabel"), QStringLiteral("Device %1").arg(modbusAddr));
+        query.bindValue(QStringLiteral(":wConfig"), wConfig.isEmpty() ? QVariant(QVariant::String) : wConfig);
+        query.bindValue(QStringLiteral(":tConfig"), tConfig.isEmpty() ? QVariant(QVariant::String) : tConfig);
+        query.bindValue(QStringLiteral(":eConfig"), eConfig.isEmpty() ? QVariant(QVariant::String) : eConfig);
+        query.bindValue(QStringLiteral(":cConfig"), cConfig.isEmpty() ? QVariant(QVariant::String) : cConfig);
+        query.bindValue(QStringLiteral(":iConfig"), iConfig.isEmpty() ? QVariant(QVariant::String) : iConfig);
+
+        if (!query.exec()) {
+            qCritical() << "同步 poll_device 失败：" << query.lastError().text();
             return false;
+        }
+
+        query.prepare(QStringLiteral("SELECT id FROM poll_device WHERE modbus_addr = :modbusAddr"));
+        query.bindValue(QStringLiteral(":modbusAddr"), modbusAddr);
+        if (!query.exec() || !query.next()) {
+            qCritical() << "查询 poll_device id 失败：" << query.lastError().text();
+            return false;
+        }
+
+        const qint64 pollDeviceId = query.value(0).toLongLong();
+
+        query.prepare(QStringLiteral("DELETE FROM poll_channel WHERE device_id = :deviceId"));
+        query.bindValue(QStringLiteral(":deviceId"), pollDeviceId);
+        if (!query.exec()) {
+            qCritical() << "删除旧 poll_channel 失败：" << query.lastError().text();
+            return false;
+        }
+
+        const QVector<PollRowInfo> entries = parsePollConfigEntries(row);
+        for (const PollRowInfo& info : entries) {
+            if (info.typePrefix == QStringLiteral("C")) {
+                static const char* metricKeys[] = {
+                    "temp", "humidity", "dust_03um", "dust_05um", "dust_10um",
+                    "dust_25um", "dust_50um", "dust_10um_total"
+                };
+                int channelNo = 1;
+                for (const char* metricKey : metricKeys) {
+                    const QString pointId = dustPointId(info.modbusAddr, QString::fromLatin1(metricKey));
+                    query.prepare(R"(
+                        INSERT INTO poll_channel
+                            (device_id, channel_type, channel_no, point_id, metric_key, start_register, register_count, enabled)
+                        VALUES (:deviceId, 'C', :channelNo, :pointId, :metricKey, 0, 1, 1)
+                    )");
+                    query.bindValue(QStringLiteral(":deviceId"), pollDeviceId);
+                    query.bindValue(QStringLiteral(":channelNo"), channelNo++);
+                    query.bindValue(QStringLiteral(":pointId"), pointId);
+                    query.bindValue(QStringLiteral(":metricKey"), QString::fromLatin1(metricKey));
+                    if (!query.exec()) {
+                        qCritical() << "插入 C poll_channel 失败：" << query.lastError().text();
+                        return false;
+                    }
+                }
+            } else if (info.typePrefix == QStringLiteral("I")) {
+                const QString pointId = makePollDeviceId(QStringLiteral("I"), info.modbusAddr, info.range.startChannel);
+                query.prepare(R"(
+                    INSERT INTO poll_channel
+                        (device_id, channel_type, channel_no, point_id, metric_key, start_register, register_count, enabled)
+                    VALUES (:deviceId, 'I', :channelNo, :pointId, NULL, :startRegister, :registerCount, 1)
+                )");
+                query.bindValue(QStringLiteral(":deviceId"), pollDeviceId);
+                query.bindValue(QStringLiteral(":channelNo"), info.range.startChannel);
+                query.bindValue(QStringLiteral(":pointId"), pointId);
+                query.bindValue(QStringLiteral(":startRegister"), info.range.startRegister);
+                query.bindValue(QStringLiteral(":registerCount"), info.range.registerCount);
+                if (!query.exec()) {
+                    qCritical() << "插入 I poll_channel 失败：" << query.lastError().text();
+                    return false;
+                }
+            } else {
+                for (int ch = info.range.startChannel; ch <= info.range.endChannel; ++ch) {
+                    const QString pointId = makePollDeviceId(info.typePrefix, info.modbusAddr, ch);
+                    const int startRegister = info.range.startRegister + (ch - info.range.startChannel);
+                    query.prepare(R"(
+                        INSERT INTO poll_channel
+                            (device_id, channel_type, channel_no, point_id, metric_key, start_register, register_count, enabled)
+                        VALUES (:deviceId, :channelType, :channelNo, :pointId, NULL, :startRegister, 1, 1)
+                    )");
+                    query.bindValue(QStringLiteral(":deviceId"), pollDeviceId);
+                    query.bindValue(QStringLiteral(":channelType"), info.typePrefix);
+                    query.bindValue(QStringLiteral(":channelNo"), ch);
+                    query.bindValue(QStringLiteral(":pointId"), pointId);
+                    query.bindValue(QStringLiteral(":startRegister"), startRegister);
+                    if (!query.exec()) {
+                        qCritical() << "插入 W/T/E poll_channel 失败：" << query.lastError().text();
+                        return false;
+                    }
+                }
+            }
         }
     }
 
-    // 插入数据
-    query.prepare(QString("INSERT INTO %1 (device_id, record_time, value, status, status_desc) VALUES (:deviceId, :recordTime, :value, :status, :statusDesc)").arg(tableName));
-    query.bindValue(":deviceId", deviceId);
-    query.bindValue(":recordTime", recordTime);
-    query.bindValue(":value", value);
-    query.bindValue(":status", status);
-    query.bindValue(":statusDesc", statusDesc);
-
+    query.prepare(R"(
+        SELECT id, point_id, device_id
+        FROM poll_channel
+        WHERE enabled = 1
+    )");
     if (!query.exec()) {
-        qCritical() << "插入" << deviceType << "设备数据失败：" << query.lastError().text();
+        qCritical() << "加载 point_id 缓存失败：" << query.lastError().text();
         return false;
+    }
+
+    while (query.next()) {
+        const QString pointId = query.value(QStringLiteral("point_id")).toString();
+        m_pointChannelIds.insert(pointId, query.value(0).toLongLong());
+        m_pointDeviceIds.insert(pointId, query.value(QStringLiteral("device_id")).toLongLong());
     }
 
     return true;
 }
 
-// 尘埃数据插入（完整数据）
-bool DBManager::insertDustData(const QString& deviceId, const QDateTime& recordTime,
-                             const QString& temp, const QString& humidity,
-                             const QString& dust03, const QString& dust05,
-                             const QString& dust10, const QString& dust25,
-                             const QString& dust50, const QString& dust10Total)
+qint64 DBManager::resolveChannelId(const QString& pointId, qint64& deviceIdOut)
 {
-    QMutexLocker locker(&m_mutex);
+    if (m_pointChannelIds.contains(pointId)) {
+        deviceIdOut = m_pointDeviceIds.value(pointId);
+        return m_pointChannelIds.value(pointId);
+    }
 
-    // 检查并重新连接数据库
+    QSqlQuery query(m_db);
+    query.prepare(QStringLiteral("SELECT id, device_id FROM poll_channel WHERE point_id = :pointId"));
+    query.bindValue(QStringLiteral(":pointId"), pointId);
+    if (!query.exec() || !query.next()) {
+        return 0;
+    }
+
+    const qint64 channelId = query.value(0).toLongLong();
+    deviceIdOut = query.value(1).toLongLong();
+    m_pointChannelIds.insert(pointId, channelId);
+    m_pointDeviceIds.insert(pointId, deviceIdOut);
+    return channelId;
+}
+
+void DBManager::enqueueReading(const QString& pointId, const QDateTime& recordTime,
+                               double valueNum, bool hasValueNum, const QString& valueRaw,
+                               const QString& status, const QString& statusDesc)
+{
+    QMutexLocker locker(&m_writeMutex);
+
+    qint64 deviceId = 0;
+    const qint64 channelId = resolveChannelId(pointId, deviceId);
+    if (channelId <= 0) {
+        return;
+    }
+
+    PendingReading reading;
+    reading.channelId = channelId;
+    reading.deviceId = deviceId;
+    reading.recordTime = recordTime;
+    reading.valueNum = valueNum;
+    reading.hasValueNum = hasValueNum;
+    reading.valueRaw = valueRaw;
+    reading.status = status;
+    reading.statusDesc = statusDesc;
+    m_pendingReadings.append(reading);
+}
+
+void DBManager::flushPendingReadings()
+{
+    QMutexLocker locker(&m_writeMutex);
+    flushPendingReadingsLocked();
+}
+
+bool DBManager::flushPendingReadingsLocked()
+{
+    if (m_pendingReadings.isEmpty()) {
+        return true;
+    }
+
     if (!checkAndReconnect()) {
         return false;
     }
 
     QSqlQuery query(m_db);
+    QString sql = QStringLiteral(
+        "INSERT INTO channel_reading (channel_id, device_id, record_time, value_num, value_raw, status, status_desc) VALUES ");
 
-    // 检查设备是否存在，不存在则添加
-    if (!deviceExists(deviceId)) {
-        if (!addDevice(deviceId, "C")) {
-            return false;
-        }
+    QStringList valueClauses;
+    for (int i = 0; i < m_pendingReadings.size(); ++i) {
+        valueClauses.append(QStringLiteral("(:channelId%1, :deviceId%1, :recordTime%1, :valueNum%1, :valueRaw%1, :status%1, :statusDesc%1)")
+                                .arg(i));
     }
 
-    // 插入数据
-    query.prepare("INSERT INTO dust_data (device_id, record_time, temp, humidity, dust_03um, dust_05um, dust_10um, dust_25um, dust_50um, dust_10um_total) VALUES (:deviceId, :recordTime, :temp, :humidity, :dust03, :dust05, :dust10, :dust25, :dust50, :dust10total)");
-    query.bindValue(":deviceId", deviceId);
-    query.bindValue(":recordTime", recordTime);
-    query.bindValue(":temp", temp);
-    query.bindValue(":humidity", humidity);
-    query.bindValue(":dust03", dust03);
-    query.bindValue(":dust05", dust05);
-    query.bindValue(":dust10", dust10);
-    query.bindValue(":dust25", dust25);
-    query.bindValue(":dust50", dust50);
-    query.bindValue(":dust10total", dust10Total);
+    sql += valueClauses.join(QStringLiteral(", "));
 
-    if (!query.exec()) {
-        qCritical() << "插入尘埃数据失败：" << query.lastError().text();
+    if (!query.prepare(sql)) {
+        qCritical() << "批量插入 channel_reading 准备失败：" << query.lastError().text();
         return false;
     }
 
+    for (int bindIndex = 0; bindIndex < m_pendingReadings.size(); ++bindIndex) {
+        const PendingReading& reading = m_pendingReadings.at(bindIndex);
+        query.bindValue(QStringLiteral(":channelId%1").arg(bindIndex), reading.channelId);
+        query.bindValue(QStringLiteral(":deviceId%1").arg(bindIndex), reading.deviceId);
+        query.bindValue(QStringLiteral(":recordTime%1").arg(bindIndex), reading.recordTime);
+        query.bindValue(QStringLiteral(":valueNum%1").arg(bindIndex),
+                        reading.hasValueNum ? QVariant(reading.valueNum) : QVariant(QVariant::Double));
+        query.bindValue(QStringLiteral(":valueRaw%1").arg(bindIndex), reading.valueRaw);
+        query.bindValue(QStringLiteral(":status%1").arg(bindIndex), reading.status);
+        query.bindValue(QStringLiteral(":statusDesc%1").arg(bindIndex), reading.statusDesc);
+    }
+
+    if (!query.exec()) {
+        qCritical() << "批量插入 channel_reading 失败：" << query.lastError().text();
+        return false;
+    }
+
+    m_pendingReadings.clear();
     return true;
 }
 
-// 插入合格率数据
+void DBManager::handleWteData(const QString& deviceType, const QString& deviceId,
+                              const QDateTime& recordTime, uint32_t value,
+                              const QString& status, const QString& statusDesc)
+{
+    Q_UNUSED(deviceType);
+    enqueueReading(deviceId, recordTime, static_cast<double>(value), true,
+                   QString::number(value), status, statusDesc);
+}
+
+void DBManager::handleDustData(const QString& deviceId, const QDateTime& recordTime,
+                               const QString& temp, const QString& humidity,
+                               const QString& dust03, const QString& dust05,
+                               const QString& dust10, const QString& dust25,
+                               const QString& dust50, const QString& dust10Total)
+{
+    const int modbusAddr = parseModbusAddrFromCDeviceId(deviceId);
+    if (modbusAddr <= 0) {
+        return;
+    }
+
+    struct DustMetric {
+        QString metricKey;
+        QString rawValue;
+    };
+
+    const QList<DustMetric> metrics = {
+        {QStringLiteral("temp"), temp},
+        {QStringLiteral("humidity"), humidity},
+        {QStringLiteral("dust_03um"), dust03},
+        {QStringLiteral("dust_05um"), dust05},
+        {QStringLiteral("dust_10um"), dust10},
+        {QStringLiteral("dust_25um"), dust25},
+        {QStringLiteral("dust_50um"), dust50},
+        {QStringLiteral("dust_10um_total"), dust10Total}
+    };
+
+    for (const DustMetric& metric : metrics) {
+        bool ok = false;
+        const double valueNum = parseDisplayNumber(metric.rawValue, &ok);
+        const QString pointId = dustPointId(modbusAddr, metric.metricKey);
+        enqueueReading(pointId, recordTime, valueNum, ok, metric.rawValue, QString(), QString());
+    }
+}
+
+void DBManager::handleChannelReading(const QString& pointId, const QDateTime& recordTime,
+                                     double valueNum, const QString& valueRaw,
+                                     const QString& status, const QString& statusDesc)
+{
+    enqueueReading(pointId, recordTime, valueNum, true, valueRaw, status, statusDesc);
+}
+
+class DBManager::ExportDeviceTask : public QRunnable
+{
+public:
+    ExportDeviceTask(DBManager* manager, int modbusAddr, const QString& filePath)
+        : m_manager(manager)
+        , m_modbusAddr(modbusAddr)
+        , m_filePath(filePath)
+    {
+        setAutoDelete(true);
+    }
+
+    void run() override
+    {
+        QString errorMessage;
+        const bool success = m_manager->exportDeviceDataToCsv(m_modbusAddr, m_filePath, errorMessage);
+        QMetaObject::invokeMethod(m_manager, [this, success, errorMessage]() {
+            emit m_manager->exportDeviceDataFinished(m_modbusAddr, success, m_filePath, errorMessage);
+        }, Qt::QueuedConnection);
+    }
+
+private:
+    DBManager* m_manager;
+    int m_modbusAddr;
+    QString m_filePath;
+};
+
+void DBManager::requestExportDeviceData(int modbusAddr, const QString& filePath)
+{
+    m_threadPool->start(new ExportDeviceTask(this, modbusAddr, filePath));
+}
+
+bool DBManager::exportDeviceDataToCsv(int modbusAddr, const QString& filePath, QString& errorMessage)
+{
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        errorMessage = QStringLiteral("只读数据库连接不可用");
+        return false;
+    }
+
+    QSqlQuery deviceQuery(m_readDb);
+    deviceQuery.prepare(QStringLiteral("SELECT id FROM poll_device WHERE modbus_addr = :modbusAddr"));
+    deviceQuery.bindValue(QStringLiteral(":modbusAddr"), modbusAddr);
+    if (!deviceQuery.exec() || !deviceQuery.next()) {
+        errorMessage = QStringLiteral("未找到 modbus 地址 %1 对应的设备").arg(modbusAddr);
+        return false;
+    }
+
+    const qint64 deviceId = deviceQuery.value(0).toLongLong();
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        errorMessage = QStringLiteral("无法打开导出文件: %1").arg(file.errorString());
+        return false;
+    }
+
+    QTextStream out(&file);
+    out.setCodec("UTF-8");
+    out << QChar(0xFEFF);
+    out << "modbus_addr,point_id,channel_type,channel_no,metric_key,record_time,value_num,value_raw,status,status_desc\n";
+
+    const int pageSize = 5000;
+    qint64 offset = 0;
+
+    while (true) {
+        QSqlQuery query(m_readDb);
+        query.prepare(R"(
+            SELECT pd.modbus_addr, pc.point_id, pc.channel_type, pc.channel_no, pc.metric_key,
+                   cr.record_time, cr.value_num, cr.value_raw, cr.status, cr.status_desc
+            FROM channel_reading cr
+            INNER JOIN poll_channel pc ON cr.channel_id = pc.id
+            INNER JOIN poll_device pd ON cr.device_id = pd.id
+            WHERE cr.device_id = :deviceId
+            ORDER BY cr.record_time, cr.id
+            LIMIT :limit OFFSET :offset
+        )");
+        query.bindValue(QStringLiteral(":deviceId"), deviceId);
+        query.bindValue(QStringLiteral(":limit"), pageSize);
+        query.bindValue(QStringLiteral(":offset"), offset);
+
+        if (!query.exec()) {
+            errorMessage = query.lastError().text();
+            return false;
+        }
+
+        int rowCount = 0;
+        while (query.next()) {
+            ++rowCount;
+            const auto csvField = [](const QVariant& value) -> QString {
+                QString text = value.toString();
+                text.replace('"', QStringLiteral("\"\""));
+                return QStringLiteral("\"%1\"").arg(text);
+            };
+
+            out << query.value(QStringLiteral("modbus_addr")).toInt() << ','
+                << csvField(query.value(QStringLiteral("point_id"))) << ','
+                << csvField(query.value(QStringLiteral("channel_type"))) << ','
+                << query.value(QStringLiteral("channel_no")).toInt() << ','
+                << csvField(query.value(QStringLiteral("metric_key"))) << ','
+                << csvField(query.value(QStringLiteral("record_time"))) << ','
+                << csvField(query.value(QStringLiteral("value_num"))) << ','
+                << csvField(query.value(QStringLiteral("value_raw"))) << ','
+                << csvField(query.value(QStringLiteral("status"))) << ','
+                << csvField(query.value(QStringLiteral("status_desc"))) << '\n';
+        }
+
+        if (rowCount < pageSize) {
+            break;
+        }
+        offset += pageSize;
+    }
+
+    file.close();
+    return true;
+}
+
 bool DBManager::insertQualifiedRateData(const QDateTime& time, double wRate, double tRate, double eRate,
-                                      double avgTemp, double avgHumidity, double avgCleanliness)
+                                        double avgTemp, double avgHumidity, double avgCleanliness)
 {
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
+    QMutexLocker locker(&m_writeMutex);
     if (!checkAndReconnect()) {
         return false;
     }
 
     QSqlQuery query(m_db);
-
-    // 插入合格率数据
-    query.prepare("INSERT INTO qualified_rate (time, w_qualified_rate, t_qualified_rate, e_qualified_rate, avg_temperature, avg_humidity, avg_cleanliness) VALUES (:time, :w_rate, :t_rate, :e_rate, :temp, :humidity, :cleanliness)");
-    query.bindValue(":time", time);
-    query.bindValue(":w_rate", wRate);
-    query.bindValue(":t_rate", tRate);
-    query.bindValue(":e_rate", eRate);
-    query.bindValue(":temp", avgTemp);
-    query.bindValue(":humidity", avgHumidity);
-    query.bindValue(":cleanliness", avgCleanliness);
+    query.prepare(R"(
+        INSERT INTO qualified_rate
+            (time, w_qualified_rate, t_qualified_rate, e_qualified_rate, avg_temperature, avg_humidity, avg_cleanliness)
+        VALUES (:time, :w_rate, :t_rate, :e_rate, :temp, :humidity, :cleanliness)
+    )");
+    query.bindValue(QStringLiteral(":time"), time);
+    query.bindValue(QStringLiteral(":w_rate"), wRate);
+    query.bindValue(QStringLiteral(":t_rate"), tRate);
+    query.bindValue(QStringLiteral(":e_rate"), eRate);
+    query.bindValue(QStringLiteral(":temp"), avgTemp);
+    query.bindValue(QStringLiteral(":humidity"), avgHumidity);
+    query.bindValue(QStringLiteral(":cleanliness"), avgCleanliness);
 
     if (!query.exec()) {
         qCritical() << "插入合格率数据失败：" << query.lastError().text();
@@ -1498,135 +874,29 @@ bool DBManager::insertQualifiedRateData(const QDateTime& time, double wRate, dou
     return true;
 }
 
-// 接收WTE数据并异步处理
-void DBManager::handleWteData(const QString& deviceType, const QString& deviceId,
-                            const QDateTime& recordTime, uint32_t value,
-                            const QString& status, const QString& statusDesc)
-{
-    // 添加日志，确认信号接收
-    QString logMessage = QString("收到WTE数据：类型=%1, 设备ID=%2, 值=%3, 状态=%4").arg(deviceType).arg(deviceId).arg(value).arg(status);
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 暂时注释掉WTE数据插入操作，只保留qualified_rate表的操作
-    // 后续可以根据需要恢复
-    /*
-    // 使用线程池异步执行数据库操作，控制线程数量
-    struct WteDataTask : public QRunnable {
-        DBManager* manager;
-        QString deviceType;
-        QString deviceId;
-        QDateTime recordTime;
-        uint32_t value;
-        QString status;
-        QString statusDesc;
-
-        WteDataTask(DBManager* m, const QString& dt, const QString& did, const QDateTime& rt, uint32_t v, const QString& s, const QString& sd)
-            : manager(m), deviceType(dt), deviceId(did), recordTime(rt), value(v), status(s), statusDesc(sd) {
-            setAutoDelete(true);
-        }
-
-        void run() override {
-            bool success = manager->insertWteData(deviceType, deviceId, recordTime, value, status, statusDesc);
-            if (success) {
-                QString successLog = QString("WTE数据插入成功：类型=%1, 设备ID=%2").arg(deviceType).arg(deviceId);
-                emit manager->logGenerated("DBManager", successLog);
-                manager->writeLogToFile("DBManager", successLog);
-            } else {
-                QString errorLog = QString("WTE数据插入失败：类型=%1, 设备ID=%2").arg(deviceType).arg(deviceId);
-                emit manager->logGenerated("DBManager", errorLog);
-                manager->writeLogToFile("DBManager", errorLog);
-            }
-        }
-    };
-
-    WteDataTask* task = new WteDataTask(this, deviceType, deviceId, recordTime, value, status, statusDesc);
-    m_threadPool->start(task);
-    */
-}
-
-// 接收尘埃数据并异步处理
-void DBManager::handleDustData(const QString& deviceId, const QDateTime& recordTime,
-                             const QString& temp, const QString& humidity,
-                             const QString& dust03, const QString& dust05,
-                             const QString& dust10, const QString& dust25,
-                             const QString& dust50, const QString& dust10Total)
-{
-    // 添加日志，确认信号接收
-    QString logMessage = QString("收到尘埃数据：设备ID=%1, 温度=%2, 湿度=%3").arg(deviceId).arg(temp).arg(humidity);
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
-
-    // 暂时注释掉尘埃数据插入操作，只保留qualified_rate表的操作
-    // 后续可以根据需要恢复
-    /*
-    // 使用线程池异步执行数据库操作，控制线程数量
-    struct DustDataTask : public QRunnable {
-        DBManager* manager;
-        QString deviceId;
-        QDateTime recordTime;
-        QString temp;
-        QString humidity;
-        QString dust03;
-        QString dust05;
-        QString dust10;
-        QString dust25;
-        QString dust50;
-        QString dust10Total;
-
-        DustDataTask(DBManager* m, const QString& did, const QDateTime& rt, const QString& t, const QString& h,
-                   const QString& d03, const QString& d05, const QString& d10, const QString& d25,
-                   const QString& d50, const QString& d10t)
-            : manager(m), deviceId(did), recordTime(rt), temp(t), humidity(h), dust03(d03), dust05(d05),
-              dust10(d10), dust25(d25), dust50(d50), dust10Total(d10t) {
-            setAutoDelete(true);
-        }
-
-        void run() override {
-            bool success = manager->insertDustData(deviceId, recordTime, temp, humidity, dust03, dust05, dust10, dust25, dust50, dust10Total);
-            if (success) {
-                QString successLog = QString("尘埃数据插入成功：设备ID=%1").arg(deviceId);
-                emit manager->logGenerated("DBManager", successLog);
-                manager->writeLogToFile("DBManager", successLog);
-            } else {
-                QString errorLog = QString("尘埃数据插入失败：设备ID=%1").arg(deviceId);
-                emit manager->logGenerated("DBManager", errorLog);
-                manager->writeLogToFile("DBManager", errorLog);
-            }
-        }
-    };
-
-    DustDataTask* task = new DustDataTask(this, deviceId, recordTime, temp, humidity, dust03, dust05, dust10, dust25, dust50, dust10Total);
-    m_threadPool->start(task);
-    */
-}
-
-// 接收合格率数据并异步处理
 void DBManager::handleQualifiedRateData(const QDateTime& time, double wRate, double tRate, double eRate,
-                                     double avgTemp, double avgHumidity, double avgCleanliness)
+                                        double avgTemp, double avgHumidity, double avgCleanliness)
 {
-    // 添加日志，确认信号接收
-    QString logMessage = QString("收到合格率数据：时间=%1, 腕带=%2%, 台垫=%3%, 设备=%4%, 温度=%5℃, 湿度=%6%RH, 洁净度=%7")
-        .arg(time.toString("yyyy-MM-dd HH:mm:ss"))
-        .arg(QString::number(wRate * 100, 'f', 2))
-        .arg(QString::number(tRate * 100, 'f', 2))
-        .arg(QString::number(eRate * 100, 'f', 2))
-        .arg(QString::number(avgTemp, 'f', 1))
-        .arg(QString::number(avgHumidity, 'f', 1))
-        .arg(QString::number(avgCleanliness, 'f', 0));
-    emit logGenerated("DBManager", logMessage);
-    writeLogToFile("DBManager", logMessage);
+    const QString logMessage = QStringLiteral("收到合格率数据：时间=%1, 腕带=%2%, 台垫=%3%, 设备=%4%, 温度=%5℃, 湿度=%6%RH, 洁净度=%7")
+                                   .arg(time.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+                                   .arg(QString::number(wRate * 100, 'f', 2))
+                                   .arg(QString::number(tRate * 100, 'f', 2))
+                                   .arg(QString::number(eRate * 100, 'f', 2))
+                                   .arg(QString::number(avgTemp, 'f', 1))
+                                   .arg(QString::number(avgHumidity, 'f', 1))
+                                   .arg(QString::number(avgCleanliness, 'f', 0));
+    emit logGenerated(QStringLiteral("DBManager"), logMessage);
+    writeLogToFile(QStringLiteral("DBManager"), logMessage);
 
     if (qFuzzyIsNull(avgTemp) || qFuzzyIsNull(avgHumidity)) {
-        QString skipLog = QString("⏭ 跳过插入：平均温度或平均湿度无效（温度=%1℃, 湿度=%2%RH）")
-            .arg(QString::number(avgTemp, 'f', 1))
-            .arg(QString::number(avgHumidity, 'f', 1));
-        emit logGenerated("DBManager", skipLog);
-        writeLogToFile("DBManager", skipLog);
+        const QString skipLog = QStringLiteral("⏭ 跳过插入：平均温度或平均湿度无效（温度=%1℃, 湿度=%2%RH）")
+                                    .arg(QString::number(avgTemp, 'f', 1))
+                                    .arg(QString::number(avgHumidity, 'f', 1));
+        emit logGenerated(QStringLiteral("DBManager"), skipLog);
+        writeLogToFile(QStringLiteral("DBManager"), skipLog);
         return;
     }
 
-    // 使用线程池异步执行数据库操作，控制线程数量
     struct QualifiedRateTask : public QRunnable {
         DBManager* manager;
         QDateTime time;
@@ -1637,83 +907,60 @@ void DBManager::handleQualifiedRateData(const QDateTime& time, double wRate, dou
         double avgHumidity;
         double avgCleanliness;
 
-        QualifiedRateTask(DBManager* m, const QDateTime& t, double w, double t_, double e, double temp, double humidity, double cleanliness)
-            : manager(m), time(t), wRate(w), tRate(t_), eRate(e), avgTemp(temp), avgHumidity(humidity), avgCleanliness(cleanliness) {
+        QualifiedRateTask(DBManager* m, const QDateTime& t, double w, double tRateValue, double e,
+                          double temp, double humidity, double cleanliness)
+            : manager(m)
+            , time(t)
+            , wRate(w)
+            , tRate(tRateValue)
+            , eRate(e)
+            , avgTemp(temp)
+            , avgHumidity(humidity)
+            , avgCleanliness(cleanliness)
+        {
             setAutoDelete(true);
         }
 
-        void run() override {
-            // 添加插入前的标志
-            emit manager->logGenerated("DBManager", "🔄 开始插入合格率数据到数据库...");
-            manager->writeLogToFile("DBManager", "开始插入合格率数据到数据库...");
+        void run() override
+        {
+            emit manager->logGenerated(QStringLiteral("DBManager"), QStringLiteral("🔄 开始插入合格率数据到数据库..."));
+            manager->writeLogToFile(QStringLiteral("DBManager"), QStringLiteral("开始插入合格率数据到数据库..."));
 
-            bool success = manager->insertQualifiedRateData(time, wRate, tRate, eRate, avgTemp, avgHumidity, avgCleanliness);
+            const bool success = manager->insertQualifiedRateData(time, wRate, tRate, eRate,
+                                                                  avgTemp, avgHumidity, avgCleanliness);
             if (success) {
-                QString successLog = QString("✅ 合格率数据插入成功：腕带=%1%, 台垫=%2%, 设备=%3%, 温度=%4℃, 湿度=%5%RH, 洁净度=%6")
-                    .arg(QString::number(wRate * 100, 'f', 2))
-                    .arg(QString::number(tRate * 100, 'f', 2))
-                    .arg(QString::number(eRate * 100, 'f', 2))
-                    .arg(QString::number(avgTemp, 'f', 1))
-                    .arg(QString::number(avgHumidity, 'f', 1))
-                    .arg(QString::number(avgCleanliness, 'f', 0));
-                emit manager->logGenerated("DBManager", successLog);
-                manager->writeLogToFile("DBManager", successLog);
+                const QString successLog = QStringLiteral("✅ 合格率数据插入成功：腕带=%1%, 台垫=%2%, 设备=%3%, 温度=%4℃, 湿度=%5%RH, 洁净度=%6")
+                                               .arg(QString::number(wRate * 100, 'f', 2))
+                                               .arg(QString::number(tRate * 100, 'f', 2))
+                                               .arg(QString::number(eRate * 100, 'f', 2))
+                                               .arg(QString::number(avgTemp, 'f', 1))
+                                               .arg(QString::number(avgHumidity, 'f', 1))
+                                               .arg(QString::number(avgCleanliness, 'f', 0));
+                emit manager->logGenerated(QStringLiteral("DBManager"), successLog);
+                manager->writeLogToFile(QStringLiteral("DBManager"), successLog);
             } else {
-                QString errorLog = QString("❌ 合格率数据插入失败");
-                emit manager->logGenerated("DBManager", errorLog);
-                manager->writeLogToFile("DBManager", errorLog);
+                emit manager->logGenerated(QStringLiteral("DBManager"), QStringLiteral("❌ 合格率数据插入失败"));
+                manager->writeLogToFile(QStringLiteral("DBManager"), QStringLiteral("合格率数据插入失败"));
             }
         }
     };
 
-    QualifiedRateTask* task = new QualifiedRateTask(this, time, wRate, tRate, eRate, avgTemp, avgHumidity, avgCleanliness);
-    m_threadPool->start(task);
-}
-
-// 写入日志到文件
-void DBManager::writeLogToFile(const QString& workerName, const QString& message)
-{
-    static QMutex fileMutex;
-    QMutexLocker locker(&fileMutex);
-
-    QString appDir = QCoreApplication::applicationDirPath();
-    QString logFilePath = appDir + "/logs";
-
-    // 创建logs目录
-    QDir logDir(logFilePath);
-    if (!logDir.exists()) {
-        logDir.mkpath(logFilePath);
-    }
-
-    // 创建日志文件名（按日期）
-    QString dateStr = QDateTime::currentDateTime().toString("yyyy-MM-dd");
-    QString logFileName = logFilePath + "/" + dateStr + "_system.log";
-
-    QFile logFile(logFileName);
-    if (logFile.open(QIODevice::Append | QIODevice::Text)) {
-        QTextStream out(&logFile);
-        QString timeStr = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz");
-        out << "[" << timeStr << "] [" << workerName << "] " << message << "\n";
-        logFile.close();
-    }
+    m_threadPool->start(new QualifiedRateTask(this, time, wRate, tRate, eRate,
+                                              avgTemp, avgHumidity, avgCleanliness));
 }
 
 bool DBManager::insertAlarmHandling(const QDateTime& handleTime, const QString& handler, const QString& action)
 {
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
+    QMutexLocker locker(&m_writeMutex);
     if (!checkAndReconnect()) {
         return false;
     }
 
     QSqlQuery query(m_db);
-
-    // 插入告警处理记录
-    query.prepare("INSERT INTO alarm_handling (handle_time, handler, action) VALUES (:handleTime, :handler, :action)");
-    query.bindValue(":handleTime", handleTime);
-    query.bindValue(":handler", handler);
-    query.bindValue(":action", action);
+    query.prepare(QStringLiteral("INSERT INTO alarm_handling (handle_time, handler, action) VALUES (:handleTime, :handler, :action)"));
+    query.bindValue(QStringLiteral(":handleTime"), handleTime);
+    query.bindValue(QStringLiteral(":handler"), handler);
+    query.bindValue(QStringLiteral(":action"), action);
 
     if (!query.exec()) {
         qCritical() << "插入告警处理记录失败：" << query.lastError().text();
@@ -1727,26 +974,27 @@ QList<QMap<QString, QVariant>> DBManager::getAlarmHandlingRecords(const QDateTim
 {
     QList<QMap<QString, QVariant>> result;
 
-    QMutexLocker locker(&m_mutex);
-
-    // 检查并重新连接数据库
-    if (!checkAndReconnect()) {
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
         return result;
     }
 
-    QSqlQuery query(m_db);
-
-    // 查询告警处理记录
-    query.prepare("SELECT id, handle_time, handler, action FROM alarm_handling WHERE handle_time >= :startTime AND handle_time <= :endTime ORDER BY handle_time DESC");
-    query.bindValue(":startTime", startTime);
-    query.bindValue(":endTime", endTime);
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT id, handle_time, handler, action
+        FROM alarm_handling
+        WHERE handle_time >= :startTime AND handle_time <= :endTime
+        ORDER BY handle_time DESC
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
 
     if (query.exec()) {
         while (query.next()) {
             QMap<QString, QVariant> record;
-            record["time"] = query.value("handle_time");
-            record["person"] = query.value("handler");
-            record["thing"] = query.value("action");
+            record[QStringLiteral("time")] = query.value(QStringLiteral("handle_time"));
+            record[QStringLiteral("person")] = query.value(QStringLiteral("handler"));
+            record[QStringLiteral("thing")] = query.value(QStringLiteral("action"));
             result.append(record);
         }
     } else {
@@ -1755,3 +1003,650 @@ QList<QMap<QString, QVariant>> DBManager::getAlarmHandlingRecords(const QDateTim
 
     return result;
 }
+
+QList<QMap<QString, QVariant>> DBManager::getLatestQualifiedRateRecords(int limit)
+{
+    QList<QMap<QString, QVariant>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT time, w_qualified_rate, t_qualified_rate, e_qualified_rate,
+               avg_temperature, avg_humidity, avg_cleanliness
+        FROM qualified_rate
+        ORDER BY time DESC
+        LIMIT :limit
+    )");
+    query.bindValue(QStringLiteral(":limit"), limit);
+
+    if (query.exec()) {
+        while (query.next()) {
+            QMap<QString, QVariant> record;
+            record[QStringLiteral("time")] = query.value(QStringLiteral("time"));
+            record[QStringLiteral("wRate")] = query.value(QStringLiteral("w_qualified_rate"));
+            record[QStringLiteral("tRate")] = query.value(QStringLiteral("t_qualified_rate"));
+            record[QStringLiteral("eRate")] = query.value(QStringLiteral("e_qualified_rate"));
+            record[QStringLiteral("avgTemp")] = query.value(QStringLiteral("avg_temperature"));
+            record[QStringLiteral("avgHumidity")] = query.value(QStringLiteral("avg_humidity"));
+            record[QStringLiteral("avgCleanliness")] = query.value(QStringLiteral("avg_cleanliness"));
+            result.append(record);
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getDustHistoryData(const QString& indexId, const QDateTime& startTime,
+                                                              const QDateTime& endTime, int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return {};
+    }
+    return queryChannelHistory(m_readDb, QStringLiteral("C"), indexId, startTime, endTime);
+}
+
+QList<QPair<QDateTime, double>> DBManager::getWHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                           int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return {};
+    }
+    return queryChannelHistory(m_readDb, QStringLiteral("W"), QString(), startTime, endTime);
+}
+
+QList<QPair<QDateTime, double>> DBManager::getTHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                           int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return {};
+    }
+    return queryChannelHistory(m_readDb, QStringLiteral("T"), QString(), startTime, endTime);
+}
+
+QList<QPair<QDateTime, double>> DBManager::getEHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                           int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return {};
+    }
+    return queryChannelHistory(m_readDb, QStringLiteral("E"), QString(), startTime, endTime);
+}
+
+QList<QPair<QDateTime, double>> DBManager::getQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT
+            DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') AS time_slot,
+            AVG((w_qualified_rate + t_qualified_rate + e_qualified_rate) / 3) AS avg_rate
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_rate")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getWQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                  int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') AS time_slot, AVG(w_qualified_rate) AS avg_rate
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_rate")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getTQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                  int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') AS time_slot, AVG(t_qualified_rate) AS avg_rate
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_rate")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getEQualifiedRateData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                  int intervalMinutes)
+{
+    Q_UNUSED(intervalMinutes);
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:00') AS time_slot, AVG(e_qualified_rate) AS avg_rate
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_rate")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getTempHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                              int intervalMinutes)
+{
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    const QString logMessage = QStringLiteral("查询温度历史数据：开始时间=%1, 结束时间=%2, 间隔=%3分钟")
+                                   .arg(startTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+                                   .arg(endTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")))
+                                   .arg(intervalMinutes);
+    emit logGenerated(QStringLiteral("DBManager"), logMessage);
+    writeLogToFile(QStringLiteral("DBManager"), logMessage);
+
+    if (!ensureReadConnection()) {
+        emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("数据库连接失败，无法查询温度历史数据"));
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT
+            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') AS time_slot,
+            AVG(avg_temperature) AS avg_value
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+    query.bindValue(QStringLiteral(":interval"), intervalMinutes);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_value")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getHumidityHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                  int intervalMinutes)
+{
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT
+            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') AS time_slot,
+            AVG(avg_humidity) AS avg_value
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+    query.bindValue(QStringLiteral(":interval"), intervalMinutes);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_value")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QList<QPair<QDateTime, double>> DBManager::getCleanlinessHistoryData(const QDateTime& startTime, const QDateTime& endTime,
+                                                                       int intervalMinutes)
+{
+    QList<QPair<QDateTime, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    query.prepare(R"(
+        SELECT
+            DATE_FORMAT(DATE_ADD(time, INTERVAL -MINUTE(time) % :interval MINUTE), '%Y-%m-%d %H:%i:00') AS time_slot,
+            AVG(avg_cleanliness) AS avg_value
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        GROUP BY time_slot
+        ORDER BY time_slot
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+    query.bindValue(QStringLiteral(":interval"), intervalMinutes);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QDateTime time = QDateTime::fromString(query.value(QStringLiteral("time_slot")).toString(),
+                                                         QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            result.append(qMakePair(time, query.value(QStringLiteral("avg_value")).toDouble()));
+        }
+    }
+
+    return result;
+}
+
+QMap<QDateTime, QMap<QString, double>> DBManager::getHistoryChartData()
+{
+    QMap<QDateTime, QMap<QString, double>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    const QDateTime endTime = QDateTime::currentDateTime();
+    const QDateTime startTime = endTime.addDays(-1);
+
+    query.prepare(R"(
+        SELECT time, w_qualified_rate, t_qualified_rate, e_qualified_rate,
+               avg_temperature, avg_humidity, avg_cleanliness
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        ORDER BY time
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        QList<QPair<QDateTime, QMap<QString, double>>> allData;
+        while (query.next()) {
+            const QDateTime time = query.value(QStringLiteral("time")).toDateTime();
+            QMap<QString, double> dataMap;
+            dataMap[QStringLiteral("腕带合格率")] = query.value(QStringLiteral("w_qualified_rate")).toDouble();
+            dataMap[QStringLiteral("台垫合格率")] = query.value(QStringLiteral("t_qualified_rate")).toDouble();
+            dataMap[QStringLiteral("设备合格率")] = query.value(QStringLiteral("e_qualified_rate")).toDouble();
+            dataMap[QStringLiteral("平均温度")] = query.value(QStringLiteral("avg_temperature")).toDouble();
+            dataMap[QStringLiteral("平均湿度")] = query.value(QStringLiteral("avg_humidity")).toDouble();
+            dataMap[QStringLiteral("平均洁净度")] = query.value(QStringLiteral("avg_cleanliness")).toDouble();
+            allData.append(qMakePair(time, dataMap));
+        }
+
+        for (int i = 0; i < allData.size(); i += 5) {
+            result[allData[i].first] = allData[i].second;
+        }
+        if (result.isEmpty() && !allData.isEmpty()) {
+            result[allData.last().first] = allData.last().second;
+        }
+    }
+
+    return result;
+}
+
+QJsonObject DBManager::getHistoryChartData(const QString& timeRange)
+{
+    QJsonObject result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    const QDateTime endTime = QDateTime::currentDateTime();
+    QDateTime startTime = endTime.addDays(-1);
+
+    if (timeRange == QStringLiteral("1h")) {
+        startTime = endTime.addSecs(-3600);
+    } else if (timeRange == QStringLiteral("7d")) {
+        startTime = endTime.addDays(-7);
+    }
+
+    query.prepare(R"(
+        SELECT time, w_qualified_rate, t_qualified_rate, e_qualified_rate,
+               avg_temperature, avg_humidity, avg_cleanliness
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+        ORDER BY time
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec()) {
+        QJsonArray timeArray;
+        QJsonArray wRateArray;
+        QJsonArray tRateArray;
+        QJsonArray eRateArray;
+        QJsonArray tempArray;
+        QJsonArray humidityArray;
+        QJsonArray cleanlinessArray;
+
+        while (query.next()) {
+            timeArray.append(query.value(QStringLiteral("time")).toDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+            wRateArray.append(query.value(QStringLiteral("w_qualified_rate")).toDouble());
+            tRateArray.append(query.value(QStringLiteral("t_qualified_rate")).toDouble());
+            eRateArray.append(query.value(QStringLiteral("e_qualified_rate")).toDouble());
+            tempArray.append(query.value(QStringLiteral("avg_temperature")).toDouble());
+            humidityArray.append(query.value(QStringLiteral("avg_humidity")).toDouble());
+            cleanlinessArray.append(query.value(QStringLiteral("avg_cleanliness")).toDouble());
+        }
+
+        result[QStringLiteral("time")] = timeArray;
+        result[QStringLiteral("wRate")] = wRateArray;
+        result[QStringLiteral("tRate")] = tRateArray;
+        result[QStringLiteral("eRate")] = eRateArray;
+        result[QStringLiteral("temperature")] = tempArray;
+        result[QStringLiteral("humidity")] = humidityArray;
+        result[QStringLiteral("cleanliness")] = cleanlinessArray;
+    }
+
+    return result;
+}
+
+QVector<double> DBManager::getAverageDataFromTimeRange(const QDateTime& startTime, int minutesRange)
+{
+    QVector<double> result(6, 0.0);
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    const QDateTime endTime = startTime.addSecs(minutesRange * 60);
+
+    query.prepare(R"(
+        SELECT
+            AVG(w_qualified_rate) AS avg_w_rate,
+            AVG(t_qualified_rate) AS avg_t_rate,
+            AVG(e_qualified_rate) AS avg_e_rate,
+            AVG(avg_temperature) AS avg_temp,
+            AVG(avg_humidity) AS avg_humidity,
+            AVG(avg_cleanliness) AS avg_cleanliness
+        FROM qualified_rate
+        WHERE time >= :startTime AND time <= :endTime
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), endTime);
+
+    if (query.exec() && query.next()) {
+        result[0] = query.value(QStringLiteral("avg_w_rate")).toDouble();
+        result[1] = query.value(QStringLiteral("avg_t_rate")).toDouble();
+        result[2] = query.value(QStringLiteral("avg_e_rate")).toDouble();
+        result[3] = query.value(QStringLiteral("avg_temp")).toDouble();
+        result[4] = query.value(QStringLiteral("avg_humidity")).toDouble();
+        result[5] = query.value(QStringLiteral("avg_cleanliness")).toDouble();
+    }
+
+    return result;
+}
+
+QMap<QString, QPair<int, int>> DBManager::getPollingStatistics(const QDateTime& time, int minutesRange)
+{
+    QMap<QString, QPair<int, int>> result;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    const QDateTime startTime = time.addSecs(-minutesRange * 60);
+
+    query.prepare(R"(
+        SELECT pc.channel_type,
+               COUNT(*) AS total_count,
+               SUM(CASE WHEN cr.status = '1' THEN 1 ELSE 0 END) AS qualified_count
+        FROM channel_reading cr
+        INNER JOIN poll_channel pc ON cr.channel_id = pc.id
+        WHERE pc.channel_type IN ('W', 'T', 'E')
+          AND cr.record_time >= :startTime AND cr.record_time <= :endTime
+        GROUP BY pc.channel_type
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), time);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QString channelType = query.value(QStringLiteral("channel_type")).toString();
+            result[channelType] = qMakePair(query.value(QStringLiteral("total_count")).toInt(),
+                                            query.value(QStringLiteral("qualified_count")).toInt());
+        }
+    }
+
+    return result;
+}
+
+QVector<double> DBManager::getPollingEnvData(const QDateTime& time, int minutesRange)
+{
+    QVector<double> result(3, 0.0);
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        return result;
+    }
+
+    QSqlQuery query(m_readDb);
+    const QDateTime startTime = time.addSecs(-minutesRange * 60);
+
+    query.prepare(R"(
+        SELECT pc.metric_key, AVG(cr.value_num) AS avg_value
+        FROM channel_reading cr
+        INNER JOIN poll_channel pc ON cr.channel_id = pc.id
+        WHERE pc.channel_type = 'C'
+          AND pc.metric_key IN ('temp', 'humidity', 'dust_05um')
+          AND cr.record_time >= :startTime AND cr.record_time <= :endTime
+          AND cr.value_num IS NOT NULL
+        GROUP BY pc.metric_key
+    )");
+    query.bindValue(QStringLiteral(":startTime"), startTime);
+    query.bindValue(QStringLiteral(":endTime"), time);
+
+    if (query.exec()) {
+        while (query.next()) {
+            const QString metricKey = query.value(QStringLiteral("metric_key")).toString();
+            const double avgValue = query.value(QStringLiteral("avg_value")).toDouble();
+            if (metricKey == QStringLiteral("temp")) {
+                result[0] = avgValue;
+            } else if (metricKey == QStringLiteral("humidity")) {
+                result[1] = avgValue;
+            } else if (metricKey == QStringLiteral("dust_05um")) {
+                result[2] = avgValue;
+            }
+        }
+    }
+
+    return result;
+}
+
+void DBManager::writeLogToFile(const QString& workerName, const QString& message)
+{
+    static QMutex fileMutex;
+    QMutexLocker locker(&fileMutex);
+
+    const QString appDir = QCoreApplication::applicationDirPath();
+    const QString logFilePath = appDir + QStringLiteral("/logs");
+
+    QDir logDir(logFilePath);
+    if (!logDir.exists()) {
+        logDir.mkpath(logFilePath);
+    }
+
+    const QString dateStr = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd"));
+    const QString logFileName = logFilePath + QDir::separator() + dateStr + QStringLiteral("_system.log");
+
+    QFile logFile(logFileName);
+    if (logFile.open(QIODevice::Append | QIODevice::Text)) {
+        QTextStream out(&logFile);
+        const QString timeStr = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"));
+        out << '[' << timeStr << "] [" << workerName << "] " << message << '\n';
+        logFile.close();
+    }
+}
+
+class DBManager::AsyncQueryTask : public QRunnable
+{
+public:
+    enum QueryType {
+        TempHistory,
+        HumidityHistory,
+        CleanlinessHistory,
+        AverageData
+    };
+
+    AsyncQueryTask(DBManager* manager, QueryType type, const QDateTime& startTime,
+                   const QDateTime& endTime, int intervalMinutes)
+        : m_manager(manager)
+        , m_type(type)
+        , m_startTime(startTime)
+        , m_endTime(endTime)
+        , m_intervalMinutes(intervalMinutes)
+        , m_minutesRange(0)
+    {
+        setAutoDelete(true);
+    }
+
+    AsyncQueryTask(DBManager* manager, const QDateTime& startTime, int minutesRange)
+        : m_manager(manager)
+        , m_type(AverageData)
+        , m_startTime(startTime)
+        , m_endTime()
+        , m_intervalMinutes(0)
+        , m_minutesRange(minutesRange)
+    {
+        setAutoDelete(true);
+    }
+
+    void run() override
+    {
+        switch (m_type) {
+        case TempHistory: {
+            const QList<QPair<QDateTime, double>> data =
+                m_manager->getTempHistoryData(m_startTime, m_endTime, m_intervalMinutes);
+            emit m_manager->tempHistoryDataReady(data);
+            break;
+        }
+        case HumidityHistory: {
+            const QList<QPair<QDateTime, double>> data =
+                m_manager->getHumidityHistoryData(m_startTime, m_endTime, m_intervalMinutes);
+            emit m_manager->humidityHistoryDataReady(data);
+            break;
+        }
+        case CleanlinessHistory: {
+            const QList<QPair<QDateTime, double>> data =
+                m_manager->getCleanlinessHistoryData(m_startTime, m_endTime, m_intervalMinutes);
+            emit m_manager->cleanlinessHistoryDataReady(data);
+            break;
+        }
+        case AverageData: {
+            const QVector<double> data = m_manager->getAverageDataFromTimeRange(m_startTime, m_minutesRange);
+            emit m_manager->averageDataReady(data);
+            break;
+        }
+        }
+    }
+
+private:
+    DBManager* m_manager;
+    QueryType m_type;
+    QDateTime m_startTime;
+    QDateTime m_endTime;
+    int m_intervalMinutes;
+    int m_minutesRange;
+};

@@ -229,6 +229,9 @@ void SerialWorker::recv()
 
         emit dataReceived(m_workerName, QString("✅ 离子风机 %1 在线").arg(devId));
         emit ionizerStatusChanged(devId, true);
+        emit channelReadingReady(devId, QDateTime::currentDateTime(), 0.0,
+                                 QString::fromLatin1(recvBuffer.toHex().toUpper()),
+                                 QStringLiteral("ONLINE"), QStringLiteral("在线"));
 
         // 将离子风机数据添加到addressFuncData（使用和其他设备相同的格式）
         QString dataHex = recvBuffer.toHex().toUpper();
@@ -533,6 +536,8 @@ void SerialWorker::onTimeout()
         if (!devId.isEmpty()) {
             emit dataReceived(m_workerName, QString("⚪ 离子风机 %1 待机（无回复）").arg(devId));
             emit ionizerStatusChanged(devId, false);  // 发射待机状态信号
+            emit channelReadingReady(devId, QDateTime::currentDateTime(), 0.0, QString(),
+                                     QStringLiteral("OFFLINE"), QStringLiteral("待机（无回复）"));
 
             // 将离子风机离线状态添加到addressFuncData（使用特殊标记）
             addressFuncData["IONIZER" + devId] = QStringList() << "OFFLINE";

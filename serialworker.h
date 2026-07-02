@@ -71,6 +71,9 @@ signals:
                       const QString& dust50, const QString& dust10Total);
     void qualifiedRateDataReady(const QDateTime& time, double wRate, double tRate, double eRate,
                               double avgTemp, double avgHumidity, double avgCleanliness);
+    void channelReadingReady(const QString& pointId, const QDateTime& recordTime,
+                             double valueNum, const QString& valueRaw,
+                             const QString& status, const QString& statusDesc);
     void toolCommandCompleted(const QByteArray& frame, const QString& expectedFuncCode);
     void toolCommandFailed(const QString& reason);
 

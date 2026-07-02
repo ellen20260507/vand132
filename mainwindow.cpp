@@ -142,6 +142,18 @@ MainWindow::MainWindow(QWidget *parent)
         m_workerRateDataMap["worker2"] = data;
     });
 
+    DBManager* dbManager = DBManager::instance();
+    auto connectWorkerDb = [dbManager](SerialWorker* worker) {
+        if (!worker || !dbManager) {
+            return;
+        }
+        connect(worker, &SerialWorker::wteDataReady, dbManager, &DBManager::handleWteData, Qt::QueuedConnection);
+        connect(worker, &SerialWorker::dustDataReady, dbManager, &DBManager::handleDustData, Qt::QueuedConnection);
+        connect(worker, &SerialWorker::channelReadingReady, dbManager, &DBManager::handleChannelReading, Qt::QueuedConnection);
+    };
+    connectWorkerDb(m_worker1);
+    connectWorkerDb(m_worker2);
+
     // 连接DBManager的logGenerated信号到textBrowser
     connect(DBManager::instance(), &DBManager::logGenerated, this, [=](const QString& workerName, const QString& log){
         ui->textBrowser->append(QString("[%1] %2").arg(workerName).arg(log));
@@ -2492,6 +2504,7 @@ void MainWindow::syncPollConfigToWorkers(const QVector<QStringList>& tableData)
         m_worker1->setConfigData({});
         m_worker2->setConfigData({});
         processModbusData(tableData);
+        DBManager::instance()->syncPollConfigFromRows(tableData);
         return;
     }
 
@@ -2501,41 +2514,42 @@ void MainWindow::syncPollConfigToWorkers(const QVector<QStringList>& tableData)
         m_worker2->setConfigData({});
         processModbusData(tableData);
         writeCrashLog(QStringLiteral("[PollConfig] 单链路：线程一加载全部 %1 条配置").arg(tableData.size()));
-        return;
-    }
+    } else {
+        QVector<QStringList> worker1Config;
+        QVector<QStringList> worker2Config;
 
-    QVector<QStringList> worker1Config;
-    QVector<QStringList> worker2Config;
+        for (const QStringList& row : tableData) {
+            const QVector<PollRowInfo> entries = parsePollConfigEntries(row);
+            if (entries.isEmpty()) {
+                continue;
+            }
 
-    for (const QStringList& row : tableData) {
-        const QVector<PollRowInfo> entries = parsePollConfigEntries(row);
-        if (entries.isEmpty()) {
-            continue;
-        }
-
-        bool hasC = false;
-        bool hasWtei = false;
-        for (const PollRowInfo& info : entries) {
-            if (info.typePrefix == "C") {
-                hasC = true;
-            } else {
-                hasWtei = true;
+            bool hasC = false;
+            bool hasWtei = false;
+            for (const PollRowInfo& info : entries) {
+                if (info.typePrefix == "C") {
+                    hasC = true;
+                } else {
+                    hasWtei = true;
+                }
+            }
+            if (hasC) {
+                worker1Config.append(row);
+            }
+            if (hasWtei) {
+                worker2Config.append(row);
             }
         }
-        if (hasC) {
-            worker1Config.append(row);
-        }
-        if (hasWtei) {
-            worker2Config.append(row);
-        }
+
+        m_worker1->setConfigData(worker1Config);
+        m_worker1->setTaskType(TaskType::C_TYPE);
+        m_worker2->setConfigData(worker2Config);
+        processModbusData(tableData);
+        writeCrashLog(QStringLiteral("[PollConfig] 双链路：线程一 %1 条，线程二 %2 条")
+                          .arg(worker1Config.size()).arg(worker2Config.size()));
     }
 
-    m_worker1->setConfigData(worker1Config);
-    m_worker1->setTaskType(TaskType::C_TYPE);
-    m_worker2->setConfigData(worker2Config);
-    processModbusData(tableData);
-    writeCrashLog(QStringLiteral("[PollConfig] 双链路：线程一 %1 条，线程二 %2 条")
-                      .arg(worker1Config.size()).arg(worker2Config.size()));
+    DBManager::instance()->syncPollConfigFromRows(tableData);
 }
 
 void MainWindow::onPushButtonDeleteClicked()
