@@ -1,0 +1,12 @@
+Makefile*
+object_script.*
+.qmake.stash
+build.log
+release/
+debug/
+installer/staging/
+installer/output/
+*.user
+*.user.*
+vand1.pro.user*
+dbmanager_backup.cpp

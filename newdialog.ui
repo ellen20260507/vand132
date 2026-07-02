@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>newdialog</class>
+ <widget class="QDialog" name="newdialog">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>900</width>
+    <height>500</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Dialog</string>
+  </property>
+  <widget class="QWidget" name="layoutWidget">
+   <property name="geometry">
+    <rect>
+     <x>20</x>
+     <y>10</y>
+     <width>860</width>
+     <height>441</height>
+    </rect>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <widget class="QTableWidget" name="tableWidget">
+      <property name="rowCount">
+       <number>1</number>
+      </property>
+      <property name="columnCount">
+       <number>6</number>
+      </property>
+      <property name="horizontalScrollBarPolicy">
+       <enum>Qt::ScrollBarAlwaysOff</enum>
+      </property>
+      <property name="sizeAdjustPolicy">
+       <enum>QAbstractScrollArea::AdjustToContents</enum>
+      </property>
+      <row/>
+      <column>
+       <property name="text">
+        <string>地址</string>
+       </property>
+       <property name="width">
+        <number>80</number>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>腕带</string>
+       </property>
+       <property name="width">
+        <number>100</number>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>台垫</string>
+       </property>
+       <property name="width">
+        <number>100</number>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>设备</string>
+       </property>
+       <property name="width">
+        <number>100</number>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>尘埃</string>
+       </property>
+       <property name="width">
+        <number>100</number>
+       </property>
+      </column>
+      <column>
+       <property name="text">
+        <string>离子风机</string>
+       </property>
+       <property name="width">
+        <number>120</number>
+       </property>
+      </column>
+     </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout">
+      <item>
+       <widget class="QPushButton" name="addRowBtn">
+        <property name="text">
+         <string>添加行</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="deleteRowBtn">
+        <property name="text">
+         <string>删除行</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="saveBtn">
+        <property name="text">
+         <string>保存配置</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
