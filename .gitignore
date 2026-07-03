@@ -2,7 +2,6 @@ Makefile*
 object_script.*
 .qmake.stash
 build.log
-release/
 debug/
 installer/staging/
 installer/output/
@@ -10,3 +9,15 @@ installer/output/
 *.user.*
 vand1.pro.user*
 dbmanager_backup.cpp
+
+# release 构建中间产物忽略，保留可运行程序与配置
+release/*.o
+release/moc_*
+release/qrc_*
+release/moc_predefs.h
+release/err.txt
+release/logs/
+
+# 大二进制/第三方（不提交）
+opencv/
+mysql-installer-community-8.0.45.0.msi

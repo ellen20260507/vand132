@@ -1,0 +1,73 @@
+{
+    "currentImageIndex": 0,
+    "images": [
+        {
+            "devices": [
+                {
+                    "id": "W1-1",
+                    "type": "W",
+                    "x": 46,
+                    "y": 56
+                },
+                {
+                    "id": "T1-1",
+                    "type": "T",
+                    "x": 98,
+                    "y": 56
+                },
+                {
+                    "id": "W2-1",
+                    "type": "W",
+                    "x": 150,
+                    "y": 56
+                },
+                {
+                    "id": "T2-1",
+                    "type": "T",
+                    "x": 202,
+                    "y": 56
+                },
+                {
+                    "id": "E2001-1",
+                    "type": "E",
+                    "x": 254,
+                    "y": 56
+                },
+                {
+                    "id": "E2001-2",
+                    "type": "E",
+                    "x": 306,
+                    "y": 56
+                },
+                {
+                    "id": "E2001-3",
+                    "type": "E",
+                    "x": 358,
+                    "y": 56
+                },
+                {
+                    "id": "E2001-4",
+                    "type": "E",
+                    "x": 410,
+                    "y": 56
+                }
+            ],
+            "imagePath": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "theme": "静电管理在线监控系统 ESD-1000.V1.0"
+        }
+    ],
+    "separateEnvEsd": false,
+    "serialConfig": {
+        "baudRate": "4800",
+        "connectionType": 1,
+        "delay": "100",
+        "maxResend": "2",
+        "overtime": "200",
+        "port1": "COM1",
+        "port2": "COM1",
+        "sendInterval": "2",
+        "serialMode": 0,
+        "tcpServerIp": "192.168.1.176",
+        "tcpServerPort": "1882"
+    }
+}

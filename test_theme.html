@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>主题测试页面</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .theme-display {
+            background-color: #f5f5f5;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .log {
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            padding: 10px;
+            margin-top: 20px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>主题测试页面</h1>
+        <p>此页面用于测试主题API功能</p>
+        
+        <div class="theme-display">
+            当前主题: <span id="currentTheme">加载中...</span>
+        </div>
+        
+        <button onclick="fetchTheme()">获取当前主题</button>
+        <button onclick="startAutoUpdate()">开始自动更新(每3秒)</button>
+        <button onclick="stopAutoUpdate()">停止自动更新</button>
+        <button onclick="clearLog()">清空日志</button>
+        
+        <div class="log" id="logContainer">
+            <div>日志输出将显示在这里...</div>
+        </div>
+    </div>
+
+    <script>
+        let updateInterval = null;
+        const logContainer = document.getElementById('logContainer');
+        const currentThemeSpan = document.getElementById('currentTheme');
+        
+        // 添加日志
+        function addLog(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            const logEntry = document.createElement('div');
+            logEntry.textContent = `[${timestamp}] ${message}`;
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+        
+        // 获取并更新主题
+        function fetchTheme() {
+            addLog('正在获取主题...');
+            
+            fetch('http://localhost:1388/api/theme')
+                .then(response => {
+                    addLog(`响应状态: ${response.status} ${response.statusText}`);
+                    return response.json();
+                })
+                .then(data => {
+                    addLog(`获取到的主题数据: ${JSON.stringify(data)}`);
+                    currentThemeSpan.textContent = data.theme;
+                    document.title = data.theme;
+                    addLog(`页面标题已更新为: ${document.title}`);
+                })
+                .catch(error => {
+                    addLog(`获取主题失败: ${error.message}`);
+                });
+        }
+        
+        // 开始自动更新
+        function startAutoUpdate() {
+            if (updateInterval) {
+                addLog('自动更新已在运行中');
+                return;
+            }
+            
+            addLog('开始自动更新主题(每3秒)');
+            updateInterval = setInterval(fetchTheme, 3000);
+            // 立即执行一次
+            fetchTheme();
+        }
+        
+        // 停止自动更新
+        function stopAutoUpdate() {
+            if (updateInterval) {
+                clearInterval(updateInterval);
+                updateInterval = null;
+                addLog('已停止自动更新');
+            } else {
+                addLog('自动更新未在运行');
+            }
+        }
+        
+        // 清空日志
+        function clearLog() {
+            logContainer.innerHTML = '<div>日志已清空...</div>';
+        }
+        
+        // 页面加载完成后立即获取一次主题
+        document.addEventListener('DOMContentLoaded', function() {
+            addLog('页面加载完成，准备获取主题');
+            setTimeout(fetchTheme, 1000);
+        });
+    </script>
+</body>
+</html>

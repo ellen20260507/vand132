@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1920, height=1080, initial-scale=1.0">
+    <title>报警处理窗口模拟</title>
+    <style>
+        :root {
+            --primary: #165DFF;
+            --secondary: #0E2F56;
+            --accent: #36CFC9;
+            --text-light: #FFFFFF;
+            --text-secondary: #86909C;
+            --bg-primary: #0F172A;
+            --bg-card: #0F1E35;
+            --border-glow: linear-gradient(135deg, rgba(22, 93, 255, 0.6), rgba(54, 207, 205, 0.6));
+            --shadow: 0 0 15px rgba(22, 93, 255, 0.3);
+            --transition: all 0.3s ease;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 1920px;
+            height: 1080px;
+            font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+            overflow: hidden;
+            background-color: var(--bg-primary);
+            color: var(--text-light);
+            background-image: radial-gradient(circle at center, rgba(22, 93, 255, 0.1) 0%, transparent 60%);
+            margin: 0 auto;
+        }
+        .top-bar {
+            height: 60px;
+            background: var(--secondary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 40px;
+            box-shadow: var(--shadow);
+            position: relative;
+            z-index: 10;
+        }
+        .title {
+            font-size: 28px;
+            font-weight: 680;
+            text-align: center;
+            width: 100%;
+            position: absolute;
+            left: 0;
+            letter-spacing: 2px;
+        }
+        .content {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: calc(100vh - 60px);
+            background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+        }
+        @keyframes borderGlow { 0% { background-position: 0 0; } 50% { background-position: 100% 100%; } 100% { background-position: 0 0; } }
+        /* 报警弹窗样式 */
+        #alarmModal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 1920px;
+            height: 1080px;
+            background-color: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 1;
+            pointer-events: all;
+            transition: opacity 0.3s ease;
+        }
+        #alarmModal .modal-content {
+            background-color: var(--bg-card);
+            border-radius: 8px;
+            padding: 25px;
+            width: 450px;
+            box-shadow: var(--shadow);
+            position: relative;
+        }
+        #alarmModal .modal-content::before {
+            content: '';
+            position: absolute;
+            top: -2px;
+            left: -2px;
+            right: -2px;
+            bottom: -2px;
+            background: var(--border-glow);
+            border-radius: 10px;
+            z-index: -1;
+            animation: borderGlow 3s linear infinite;
+        }
+        #alarmModal .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid rgba(22, 93, 255, 0.3);
+        }
+        #alarmModal .modal-title {
+            font-size: 18px;
+            color: var(--primary);
+            font-weight: 600;
+            margin: 0;
+        }
+        #alarmModal .close-btn {
+            background: none;
+            border: none;
+            font-size: 22px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 2px 8px;
+            border-radius: 4px;
+            transition: background-color 0.2s ease;
+        }
+        #alarmModal .close-btn:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: #f53f3f;
+        }
+        #alarmModal .modal-body {
+            font-size: 15px;
+            line-height: 2.0;
+        }
+        #alarmModal .modal-body p {
+            margin: 10px 0;
+            color: var(--text-light);
+            display: flex;
+            justify-content: space-between;
+        }
+        #alarmModal .modal-body strong {
+            color: var(--accent);
+            flex-shrink: 0;
+            width: 100px;
+        }
+        #alarmModal .alarm-input {
+            width: 200px;
+            padding: 8px 12px;
+            border: 1px solid #4A5568;
+            border-radius: 4px;
+            background-color: var(--bg-card);
+            color: var(--text-light);
+            font-size: 14px;
+        }
+        #alarmModal .alarm-input:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+        #alarmModal .modal-footer {
+            margin-top: 20px;
+            display: flex;
+            justify-content: flex-end;
+        }
+        #alarmModal .btn-confirm {
+            background-color: var(--accent);
+            color: var(--bg-card);
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s ease;
+        }
+        #alarmModal .btn-confirm:hover {
+            background-color: #38B2AC;
+        }
+        #alarmModal .btn-confirm:disabled {
+            background-color: #4A5568;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="top-bar">
+        <div class="title">静电管理在线监控系统 ESD-1000.V1.0</div>
+    </div>
+    <div class="content">
+            <div style="text-align: center;">
+                <h2 style="color: var(--accent); margin-bottom: 20px;">报警处理窗口模拟</h2>
+                <p style="color: var(--text-secondary); margin-bottom: 40px;">当腕带或台垫设备出现异常时，系统会弹出如下报警处理窗口</p>
+                
+                <div style="display: flex; justify-content: center; gap: 20px;">
+                    <button onclick="showWristbandAlarm()" style="padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 4px; cursor: pointer;">模拟腕带报警</button>
+                    <button onclick="showMatAlarm()" style="padding: 10px 20px; background: var(--accent); color: var(--bg-card); border: none; border-radius: 4px; cursor: pointer;">模拟台垫报警</button>
+                    <button onclick="showDeviceAlarm()" style="padding: 10px 20px; background: #f53f3f; color: white; border: none; border-radius: 4px; cursor: pointer;">模拟设备报警</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 报警弹窗 -->
+        <div id="alarmModal" style="opacity: 0; pointer-events: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 class="modal-title">⚠️ 报警处理</h3>
+                    <button class="close-btn" onclick="hideAlarmModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p><strong>报警处理平台</strong></p>
+                    <p><strong>监视通道:</strong> <span id="alarmChannel" style="color: #f53f3f;">W001</span></p>
+                    <p><strong>监测类别:</strong> <span id="alarmCategory" style="color: #f53f3f;">腕带</span></p>
+                    <p><strong>监测对象:</strong> SMT生产线-工位001</p>
+                    <p><strong>合格阈值:</strong> <span id="alarmThreshold">0.75MΩ-35MΩ</span></p>
+                    <p><strong>监测数据:</strong> <span id="alarmData" style="color: #f53f3f; font-weight: bold;">5000 MΩ</span></p>
+                    <p><strong>报警时间:</strong> <span id="alarmTime"></span></p>
+                    <p><strong>处理人员:</strong> <input type="text" id="alarmHandler" class="alarm-input" placeholder="请输入处理人员姓名"></p>
+                    <p><strong>处理方式:</strong> <input type="text" id="alarmAction" class="alarm-input" placeholder="请输入处理措施（如：更换腕带、检查接地等）"></p>
+                </div>
+                <div class="modal-footer">
+                    <button id="alarmCancelBtn" onclick="hideAlarmModal()" style="padding: 8px 16px; background: #4A5568; color: white; border: none; border-radius: 4px; margin-right: 10px; cursor: pointer;">取消</button>
+                    <button id="alarmConfirmBtn" class="btn-confirm">确认处理</button>
+                </div>
+            </div>
+        </div>
+
+    <script>
+        // 显示报警弹窗
+        function showAlarmModal(channel, category, threshold, data) {
+            document.getElementById('alarmChannel').textContent = channel;
+            document.getElementById('alarmCategory').textContent = category;
+            document.getElementById('alarmThreshold').textContent = threshold;
+            document.getElementById('alarmData').textContent = data;
+            document.getElementById('alarmTime').textContent = new Date().toLocaleString('zh-CN');
+            
+            // 清空输入框
+            document.getElementById('alarmHandler').value = '';
+            document.getElementById('alarmAction').value = '';
+            
+            // 显示弹窗
+            const modal = document.getElementById('alarmModal');
+            modal.style.display = 'flex';
+            setTimeout(() => {
+                modal.style.opacity = '1';
+                modal.style.pointerEvents = 'all';
+            }, 10);
+            
+            // 聚焦到处理人员输入框
+            setTimeout(() => {
+                document.getElementById('alarmHandler').focus();
+            }, 300);
+        }
+        
+        // 隐藏报警弹窗
+        function hideAlarmModal() {
+            const modal = document.getElementById('alarmModal');
+            modal.style.opacity = '0';
+            modal.style.pointerEvents = 'none';
+        }
+        
+        // 模拟腕带报警
+        function showWristbandAlarm() {
+            showAlarmModal('W001', '腕带', '0.75MΩ-35MΩ', '5000 MΩ');
+        }
+        
+        // 模拟台垫报警
+        function showMatAlarm() {
+            showAlarmModal('T002', '台垫', '0.75MΩ-35MΩ', '8000 MΩ');
+        }
+        
+        // 模拟设备报警
+        function showDeviceAlarm() {
+            showAlarmModal('E003', '设备', '1MΩ-100MΩ', '15000 MΩ');
+        }
+        
+        // 确认按钮功能
+        document.getElementById('alarmConfirmBtn').addEventListener('click', function() {
+            const handler = document.getElementById('alarmHandler').value.trim();
+            const action = document.getElementById('alarmAction').value.trim();
+            
+            if (!handler) {
+                alert('请输入处理人员姓名');
+                document.getElementById('alarmHandler').focus();
+                return;
+            }
+            
+            if (!action) {
+                alert('请输入处理措施');
+                document.getElementById('alarmAction').focus();
+                return;
+            }
+            
+            // 模拟提交成功
+            alert(`✅ 报警处理成功！\n处理人员：${handler}\n处理方式：${action}`);
+            hideAlarmModal();
+        });
+        
+        // 点击背景关闭弹窗
+        document.getElementById('alarmModal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                hideAlarmModal();
+            }
+        });
+    </script>
+</body>
+</html>

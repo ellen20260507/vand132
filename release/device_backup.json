@@ -1,0 +1,61 @@
+{
+    "backup_time": "周四 6月 11 16:07:18 2026",
+    "devices": [
+        {
+            "id": "W1-1",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "W",
+            "x": 46,
+            "y": 56
+        },
+        {
+            "id": "T1-1",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "T",
+            "x": 98,
+            "y": 56
+        },
+        {
+            "id": "W2-1",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "W",
+            "x": 150,
+            "y": 56
+        },
+        {
+            "id": "T2-1",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "T",
+            "x": 202,
+            "y": 56
+        },
+        {
+            "id": "E2001-1",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "E",
+            "x": 254,
+            "y": 56
+        },
+        {
+            "id": "E2001-2",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "E",
+            "x": 306,
+            "y": 56
+        },
+        {
+            "id": "E2001-3",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "E",
+            "x": 358,
+            "y": 56
+        },
+        {
+            "id": "E2001-4",
+            "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "type": "E",
+            "x": 410,
+            "y": 56
+        }
+    ]
+}
