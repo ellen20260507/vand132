@@ -8,21 +8,21 @@
 #include <QTextStream>
 #include <QHeaderView>
 #include <QFileDialog>
+#include <QAbstractItemView>
 
 newdialog::newdialog(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::newdialog)
 {
     ui->setupUi(this);
+    resize(980, 520);
     this->setWindowTitle(QStringLiteral("轮询设置"));
     setStyleSheet(buildAdminPanelStyleSheet());
     applyAdminPanelFont(this);
     applyAdminPanelControlSizes(this, 180, 44);
     applyAdminPanelLayoutSpacing(this, 14, 16);
-    ui->tableWidget->horizontalHeader()->setStretchLastSection(false);
-    ui->tableWidget->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
-    ui->tableWidget->horizontalHeader()->setSectionResizeMode(kDataColumnCount, QHeaderView::Fixed);
-    ui->tableWidget->setColumnWidth(kDataColumnCount, 90);
+
+    setupTableColumns();
 
     connect(ui->addRowBtn, &QPushButton::clicked, this, &newdialog::addRowBtn_clicked);
     connect(ui->deleteRowBtn, &QPushButton::clicked, this, &newdialog::deleteRowBtn_clicked);
@@ -30,24 +30,75 @@ newdialog::newdialog(QWidget *parent) :
     connect(DBManager::instance(), &DBManager::exportDeviceDataFinished,
             this, &newdialog::onExportFinished);
 
-    ui->tableWidget->setColumnCount(kDataColumnCount + 1);
-    ui->tableWidget->setHorizontalHeaderLabels({
+    loadConfigFromFile();
+}
+
+newdialog::~newdialog()
+{
+    delete ui;
+}
+
+void newdialog::setupTableColumns()
+{
+    QTableWidget* table = ui->tableWidget;
+    QHeaderView* header = table->horizontalHeader();
+
+    table->setColumnCount(kDataColumnCount + 1);
+    table->setHorizontalHeaderLabels({
         QStringLiteral("地址"), QStringLiteral("腕带"), QStringLiteral("台垫"),
         QStringLiteral("设备"), QStringLiteral("尘埃"), QStringLiteral("离子风机"),
         QStringLiteral("下载")
     });
 
+    table->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    table->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setEditTriggers(QAbstractItemView::DoubleClicked
+                           | QAbstractItemView::SelectedClicked
+                           | QAbstractItemView::EditKeyPressed);
+
+    header->setStretchLastSection(false);
+    header->setMinimumSectionSize(72);
+    for (int col = 0; col < kDataColumnCount; ++col) {
+        header->setSectionResizeMode(col, QHeaderView::Stretch);
+    }
+    header->setSectionResizeMode(kDataColumnCount, QHeaderView::Fixed);
+    table->setColumnWidth(kDataColumnCount, 72);
+}
+
+void newdialog::ensureRowItems(int row)
+{
+    for (int col = 0; col < kDataColumnCount; ++col) {
+        if (!ui->tableWidget->item(row, col)) {
+            auto* item = new QTableWidgetItem(QString());
+            item->setFlags(item->flags() | Qt::ItemIsEditable | Qt::ItemIsSelectable | Qt::ItemIsEnabled);
+            ui->tableWidget->setItem(row, col, item);
+        }
+    }
+    setupDownloadButton(row);
+}
+
+void newdialog::loadConfigFromFile()
+{
+    ui->tableWidget->setRowCount(0);
+
     QFile file(getFilePath());
     if (!file.exists()) {
+        ui->tableWidget->insertRow(0);
+        ensureRowItems(0);
         return;
     }
+
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
         QMessageBox::warning(this, QStringLiteral("文件错误"),
                              QStringLiteral("加载失败！无法打开文件: ") + file.errorString());
+        ui->tableWidget->insertRow(0);
+        ensureRowItems(0);
         return;
     }
+
     QTextStream in(&file);
-    ui->tableWidget->setRowCount(0);
     while (!in.atEnd()) {
         QString line = in.readLine().trimmed();
         if (line.isEmpty()) {
@@ -58,22 +109,31 @@ newdialog::newdialog(QWidget *parent) :
         ui->tableWidget->insertRow(row);
         for (int col = 0; col < kDataColumnCount; ++col) {
             const QString text = (col < parts.size()) ? parts[col] : QString();
-            ui->tableWidget->setItem(row, col, new QTableWidgetItem(text));
+            auto* item = new QTableWidgetItem(text);
+            item->setFlags(item->flags() | Qt::ItemIsEditable | Qt::ItemIsSelectable | Qt::ItemIsEnabled);
+            ui->tableWidget->setItem(row, col, item);
         }
         setupDownloadButton(row);
     }
     file.close();
-}
 
-newdialog::~newdialog()
-{
-    delete ui;
+    if (ui->tableWidget->rowCount() == 0) {
+        ui->tableWidget->insertRow(0);
+        ensureRowItems(0);
+    }
 }
 
 void newdialog::setupDownloadButton(int row)
 {
+    if (auto* oldBtn = ui->tableWidget->cellWidget(row, kDataColumnCount)) {
+        ui->tableWidget->removeCellWidget(row, kDataColumnCount);
+        oldBtn->deleteLater();
+    }
+
     auto* btn = new QPushButton(QStringLiteral("下载"));
     btn->setProperty("row", row);
+    btn->setMinimumWidth(56);
+    btn->setMaximumWidth(72);
     connect(btn, &QPushButton::clicked, this, &newdialog::onDownloadClicked);
     ui->tableWidget->setCellWidget(row, kDataColumnCount, btn);
 }
@@ -81,7 +141,11 @@ void newdialog::setupDownloadButton(int row)
 void newdialog::refreshAllDownloadButtons()
 {
     for (int row = 0; row < ui->tableWidget->rowCount(); ++row) {
-        setupDownloadButton(row);
+        if (auto* btn = qobject_cast<QPushButton*>(ui->tableWidget->cellWidget(row, kDataColumnCount))) {
+            btn->setProperty("row", row);
+        } else {
+            setupDownloadButton(row);
+        }
     }
 }
 
@@ -89,10 +153,7 @@ void newdialog::addRowBtn_clicked()
 {
     const int currentRow = ui->tableWidget->rowCount();
     ui->tableWidget->insertRow(currentRow);
-    for (int col = 0; col < kDataColumnCount; ++col) {
-        ui->tableWidget->setItem(currentRow, col, new QTableWidgetItem(QString()));
-    }
-    setupDownloadButton(currentRow);
+    ensureRowItems(currentRow);
 }
 
 void newdialog::deleteRowBtn_clicked()
@@ -100,7 +161,12 @@ void newdialog::deleteRowBtn_clicked()
     const int selectedRow = ui->tableWidget->currentRow();
     if (selectedRow >= 0) {
         ui->tableWidget->removeRow(selectedRow);
-        refreshAllDownloadButtons();
+        if (ui->tableWidget->rowCount() == 0) {
+            ui->tableWidget->insertRow(0);
+            ensureRowItems(0);
+        } else {
+            refreshAllDownloadButtons();
+        }
     } else {
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先选中要删除的行！"));
     }
@@ -133,12 +199,17 @@ void newdialog::saveBtn_clicked()
         QTableWidgetItem *dustItem = ui->tableWidget->item(row, 4);
         QTableWidgetItem *ionFanItem = ui->tableWidget->item(row, 5);
 
-        const QString addr = addrItem ? addrItem->text() : QString();
-        const QString wristConfig = wristItem ? wristItem->text() : QString();
-        const QString matConfig = matItem ? matItem->text() : QString();
-        const QString devConfig = devItem ? devItem->text() : QString();
-        const QString dustConfig = dustItem ? dustItem->text() : QString();
-        const QString ionFanConfig = ionFanItem ? ionFanItem->text() : QString();
+        const QString addr = addrItem ? addrItem->text().trimmed() : QString();
+        const QString wristConfig = wristItem ? wristItem->text().trimmed() : QString();
+        const QString matConfig = matItem ? matItem->text().trimmed() : QString();
+        const QString devConfig = devItem ? devItem->text().trimmed() : QString();
+        const QString dustConfig = dustItem ? dustItem->text().trimmed() : QString();
+        const QString ionFanConfig = ionFanItem ? ionFanItem->text().trimmed() : QString();
+
+        if (addr.isEmpty() && wristConfig.isEmpty() && matConfig.isEmpty()
+            && devConfig.isEmpty() && dustConfig.isEmpty() && ionFanConfig.isEmpty()) {
+            continue;
+        }
 
         if (addr.isEmpty()) {
             QMessageBox::warning(this, QStringLiteral("错误"), QStringLiteral("第%1行地址不能为空").arg(row + 1));
@@ -192,7 +263,10 @@ void newdialog::saveBtn_clicked()
         QStringList cols;
         for (int col = 0; col < kDataColumnCount; ++col) {
             QTableWidgetItem *item = ui->tableWidget->item(row, col);
-            cols.append(item ? item->text() : QString());
+            cols.append(item ? item->text().trimmed() : QString());
+        }
+        if (cols[0].isEmpty()) {
+            continue;
         }
         out << cols.join(",") << "\n";
     }
@@ -209,7 +283,10 @@ QVector<QStringList> newdialog::getTableData()
         QStringList currentRow;
         for (int col = 0; col < kDataColumnCount; ++col) {
             QTableWidgetItem *item = ui->tableWidget->item(row, col);
-            currentRow.append(item ? item->text() : QString());
+            currentRow.append(item ? item->text().trimmed() : QString());
+        }
+        if (currentRow[0].isEmpty()) {
+            continue;
         }
         allRowData.append(currentRow);
     }

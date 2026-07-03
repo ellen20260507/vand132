@@ -32,6 +32,9 @@ private:
         return qApp->applicationDirPath() + "/poll_config.txt";
     }
 
+    void setupTableColumns();
+    void ensureRowItems(int row);
+    void loadConfigFromFile();
     void setupDownloadButton(int row);
     void refreshAllDownloadButtons();
 

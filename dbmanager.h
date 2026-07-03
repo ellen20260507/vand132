@@ -116,6 +116,7 @@ private:
     QMutex m_writeMutex;
     QMutex m_readMutex;
     bool m_isConnected = false;
+    bool m_dbEverConnected = false;
     QThreadPool* m_threadPool = nullptr;
     QTimer* m_flushTimer = nullptr;
     QList<PendingReading> m_pendingReadings;

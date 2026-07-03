@@ -222,6 +222,7 @@ bool DBManager::initDB(const QString& host, int port, const QString& user, const
     }
 
     m_isConnected = true;
+    m_dbEverConnected = true;
     qDebug() << "数据库连接成功";
     emit logGenerated(QStringLiteral("DBManager"), QStringLiteral("✓ 成功连接到数据库: %1").arg(dbName));
 
@@ -378,6 +379,11 @@ bool DBManager::checkAndReconnect()
         if (testQuery.exec(QStringLiteral("SELECT 1"))) {
             return true;
         }
+    }
+
+    // 从未成功连上过时直接失败，避免启动阶段在主线程空等重试
+    if (!m_dbEverConnected) {
+        return false;
     }
 
     const int maxRetry = 3;
