@@ -1,5 +1,5 @@
 {
-    "backup_time": "周四 6月 11 16:07:18 2026",
+    "backup_time": "周一 7月 6 14:15:10 2026",
     "devices": [
         {
             "id": "W1-1",
@@ -54,8 +54,8 @@
             "id": "E2001-4",
             "image_path": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
             "type": "E",
-            "x": 410,
-            "y": 56
+            "x": 502,
+            "y": 20
         }
     ]
 }

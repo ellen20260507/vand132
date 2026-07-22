@@ -1,0 +1,57 @@
+ESD 预测预警 - AI 云端免费对接说明
+====================================
+
+当前默认使用「硅基流动 SiliconFlow」云端免费模型，由 AI 自动分析数据库并写入 ai_alert 表。
+
+一、推荐：硅基流动（国内直连，有永久免费模型）
+----------------------------------------------
+
+1. 打开 https://cloud.siliconflow.cn/account/ak 注册
+2. 完成实名认证（免费模型必须）
+3. 创建 API Key 并复制
+4. 双击 setup_cloud.bat，粘贴密钥，自动测试连接
+5. 测试通过后，双击 run_once.bat 运行一次 AI 分析
+
+默认配置（config.json）：
+  provider: siliconflow
+  model: Qwen/Qwen2.5-7B-Instruct   （免费）
+  api_base: https://api.siliconflow.cn/v1
+
+二、备选：DeepSeek 云端（注册送额度）
+------------------------------------
+
+1. 注册 https://platform.deepseek.com/
+2. 创建 API Key，写入 ai_secrets.json
+3. 修改 config.json:
+     "provider": "deepseek"
+     "model": "deepseek-chat"
+4. 双击 test_ai.bat 测试
+
+三、配置文件
+------------
+config.json       - 主配置（provider、model）
+ai_secrets.json   - API Key（setup_cloud.bat 会自动生成）
+
+四、常用命令
+------------
+setup_cloud.bat          一键配置云端 API Key 并测试
+test_ai.bat              测试 AI 是否连通
+run_once.bat             运行一次 AI 分析
+install_autostart.bat    开机自启后台服务
+service_status.bat       查看日志
+
+五、查看 AI 分析结果
+--------------------
+MySQL 执行:
+  SELECT id, alert_time, severity, message
+  FROM ai_alert
+  WHERE alert_type = 'ai_analysis'
+  ORDER BY id DESC
+  LIMIT 10;
+
+六、说明
+--------
+- ai.enabled = true 时由 AI 分析
+- ai.rules_fallback = true 时，AI 失败会退回本地规则模式
+- 日志: predict_alert\logs\predict_alert.log
+- 本机 Ollama 方案仍可用，把 provider 改回 ollama 即可

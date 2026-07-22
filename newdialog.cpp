@@ -9,18 +9,32 @@
 #include <QHeaderView>
 #include <QFileDialog>
 #include <QAbstractItemView>
+#include <QHBoxLayout>
 
 newdialog::newdialog(QWidget *parent) :
     QDialog(parent),
     ui(new Ui::newdialog)
 {
     ui->setupUi(this);
-    resize(980, 520);
     this->setWindowTitle(QStringLiteral("轮询设置"));
-    setStyleSheet(buildAdminPanelStyleSheet());
+
+    const QString pollDialogExtraStyle = QStringLiteral(
+        " QTableWidget QPushButton#pollDownloadBtn {"
+        "  min-width: 0px;"
+        "  min-height: 36px;"
+        "  padding: 4px 10px;"
+        "}"
+    );
+    setStyleSheet(buildAdminPanelStyleSheet() + pollDialogExtraStyle);
+
+    if (QScreen* screen = QGuiApplication::primaryScreen()) {
+        const QRect area = screen->availableGeometry();
+        resize(qMin(1280, area.width() - 80), qMin(600, area.height() - 120));
+    }
     applyAdminPanelFont(this);
     applyAdminPanelControlSizes(this, 180, 44);
     applyAdminPanelLayoutSpacing(this, 14, 16);
+    ui->verticalLayout->setStretch(0, 1);
 
     setupTableColumns();
 
@@ -37,6 +51,19 @@ newdialog::~newdialog()
 {
     delete ui;
 }
+
+namespace {
+
+QPushButton* downloadButtonForRow(QTableWidget* table, int row, int downloadColumn)
+{
+    QWidget* cell = table->cellWidget(row, downloadColumn);
+    if (!cell) {
+        return nullptr;
+    }
+    return cell->findChild<QPushButton*>();
+}
+
+} // namespace
 
 void newdialog::setupTableColumns()
 {
@@ -59,12 +86,34 @@ void newdialog::setupTableColumns()
                            | QAbstractItemView::EditKeyPressed);
 
     header->setStretchLastSection(false);
-    header->setMinimumSectionSize(72);
+    header->setMinimumSectionSize(64);
     for (int col = 0; col < kDataColumnCount; ++col) {
         header->setSectionResizeMode(col, QHeaderView::Stretch);
     }
     header->setSectionResizeMode(kDataColumnCount, QHeaderView::Fixed);
-    table->setColumnWidth(kDataColumnCount, 72);
+    updateDownloadColumnWidth();
+}
+
+void newdialog::updateDownloadColumnWidth()
+{
+    QTableWidget* table = ui->tableWidget;
+    const QFontMetrics fm(table->font());
+    int width = qMax(kDownloadColumnMinWidth,
+                     fm.horizontalAdvance(QStringLiteral("导出中...")) + 28);
+
+    for (int row = 0; row < table->rowCount(); ++row) {
+        if (QPushButton* btn = downloadButtonForRow(table, row, kDataColumnCount)) {
+            width = qMax(width, btn->sizeHint().width() + 16);
+        }
+    }
+
+    table->setColumnWidth(kDataColumnCount, width);
+}
+
+void newdialog::showEvent(QShowEvent* event)
+{
+    QDialog::showEvent(event);
+    updateDownloadColumnWidth();
 }
 
 void newdialog::ensureRowItems(int row)
@@ -121,6 +170,8 @@ void newdialog::loadConfigFromFile()
         ui->tableWidget->insertRow(0);
         ensureRowItems(0);
     }
+
+    updateDownloadColumnWidth();
 }
 
 void newdialog::setupDownloadButton(int row)
@@ -130,18 +181,26 @@ void newdialog::setupDownloadButton(int row)
         oldBtn->deleteLater();
     }
 
+    auto* container = new QWidget();
+    auto* layout = new QHBoxLayout(container);
+    layout->setContentsMargins(2, 2, 2, 2);
+    layout->setSpacing(0);
+
     auto* btn = new QPushButton(QStringLiteral("下载"));
+    btn->setObjectName(QStringLiteral("pollDownloadBtn"));
     btn->setProperty("row", row);
-    btn->setMinimumWidth(56);
-    btn->setMaximumWidth(72);
+    btn->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
     connect(btn, &QPushButton::clicked, this, &newdialog::onDownloadClicked);
-    ui->tableWidget->setCellWidget(row, kDataColumnCount, btn);
+    layout->addWidget(btn);
+
+    ui->tableWidget->setCellWidget(row, kDataColumnCount, container);
+    updateDownloadColumnWidth();
 }
 
 void newdialog::refreshAllDownloadButtons()
 {
     for (int row = 0; row < ui->tableWidget->rowCount(); ++row) {
-        if (auto* btn = qobject_cast<QPushButton*>(ui->tableWidget->cellWidget(row, kDataColumnCount))) {
+        if (auto* btn = downloadButtonForRow(ui->tableWidget, row, kDataColumnCount)) {
             btn->setProperty("row", row);
         } else {
             setupDownloadButton(row);
@@ -323,6 +382,7 @@ void newdialog::onDownloadClicked()
 
     btn->setEnabled(false);
     btn->setText(QStringLiteral("导出中..."));
+    updateDownloadColumnWidth();
     DBManager::instance()->requestExportDeviceData(modbusAddr, path);
 }
 
@@ -331,13 +391,15 @@ void newdialog::onExportFinished(int modbusAddr, bool success, const QString& fi
     Q_UNUSED(modbusAddr);
 
     for (int row = 0; row < ui->tableWidget->rowCount(); ++row) {
-        auto* btn = qobject_cast<QPushButton*>(ui->tableWidget->cellWidget(row, kDataColumnCount));
+        auto* btn = downloadButtonForRow(ui->tableWidget, row, kDataColumnCount);
         if (!btn) {
             continue;
         }
         btn->setEnabled(true);
         btn->setText(QStringLiteral("下载"));
     }
+
+    updateDownloadColumnWidth();
 
     if (success) {
         QMessageBox::information(this, QStringLiteral("导出成功"),

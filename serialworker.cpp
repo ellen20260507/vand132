@@ -1340,6 +1340,18 @@ bool SerialWorker::isConnectionOpen() const
     return false;
 }
 
+void SerialWorker::sendRawBytes(const QByteArray& data)
+{
+    if (!isConnectionOpen() || data.isEmpty()) {
+        return;
+    }
+    if (m_connectionType == ConnectionType::SERIAL && serial) {
+        serial->write(data);
+    } else if (tcpSocket) {
+        tcpSocket->write(data);
+    }
+}
+
 void SerialWorker::sendToolCommand(const QByteArray& data, const QString& expectedFuncCode)
 {
     if (!isConnectionOpen()) {
@@ -1438,8 +1450,15 @@ bool SerialWorker::processToolReceivedData()
         || m_toolExpectedFunc == QLatin1String("0113")
         || m_toolExpectedFunc == QLatin1String("0120")
         || m_toolExpectedFunc == QLatin1String("0010")
+        || m_toolExpectedFunc == QLatin1String("0011")
+        || m_toolExpectedFunc == QLatin1String("0012")
         || m_toolExpectedFunc == QLatin1String("0013")
-        || m_toolExpectedFunc == QLatin1String("0020")) {
+        || m_toolExpectedFunc == QLatin1String("0014")
+        || m_toolExpectedFunc == QLatin1String("0015")
+        || m_toolExpectedFunc == QLatin1String("0020")
+        || m_toolExpectedFunc == QLatin1String("0021")
+        || m_toolExpectedFunc == QLatin1String("0022")
+        || m_toolExpectedFunc == QLatin1String("0040")) {
         expectedFrameLen = 10;
     } else if (recvBuffer.size() >= expectedStart + 6) {
         const QByteArray regCountBytes = recvBuffer.mid(expectedStart + 4, 2);

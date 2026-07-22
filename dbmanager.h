@@ -17,6 +17,39 @@
 #include <QHash>
 #include <QStringList>
 
+struct MesReadingQueryFilter {
+    bool hasStartTime = false;
+    bool hasEndTime = false;
+    QDateTime startTime;
+    QDateTime endTime;
+    bool allModbusAddrs = true;
+    QList<int> modbusAddrs;
+    bool allTypes = true;
+    QStringList channelTypes;
+    bool allChannels = true;
+    QList<int> channelNos;
+    int page = 1;
+    int pageSize = 1000;
+    bool allPageSize = false;
+};
+
+struct MesReadingRow {
+    QString pointId;
+    QDateTime recordTime;
+    double valueNum = 0.0;
+    bool hasValueNum = false;
+    QString statusDesc;
+};
+
+struct MesReadingQueryResult {
+    bool success = false;
+    QString errorCode;
+    QString errorMessage;
+    int total = 0;
+    QList<MesReadingRow> items;
+    MesReadingQueryFilter appliedFilter;
+};
+
 class DBManager : public QObject
 {
     Q_OBJECT
@@ -37,6 +70,8 @@ public:
     bool insertAlarmHandling(const QDateTime& handleTime, const QString& handler, const QString& action);
 
     void requestExportDeviceData(int modbusAddr, const QString& filePath);
+
+    MesReadingQueryResult queryMesReadings(const MesReadingQueryFilter& filter);
 
     QList<QPair<QDateTime, double>> getDustHistoryData(const QString& indexId, const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes = 60);
     QList<QPair<QDateTime, double>> getWHistoryData(const QDateTime& startTime, const QDateTime& endTime, int intervalMinutes = 60);
@@ -110,6 +145,8 @@ private:
     bool flushPendingReadingsLocked();
     bool exportDeviceDataToCsv(int modbusAddr, const QString& filePath, QString& errorMessage);
     qint64 resolveChannelId(const QString& pointId, qint64& deviceIdOut);
+    QString buildMesReadingsWhereClause(const MesReadingQueryFilter& filter, QStringList& bindKeys) const;
+    void bindMesReadingsFilter(QSqlQuery& query, const MesReadingQueryFilter& filter, const QStringList& bindKeys) const;
 
     QSqlDatabase m_db;
     QSqlDatabase m_readDb;

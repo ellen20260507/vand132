@@ -39,6 +39,15 @@ Get-ChildItem $DeploySource -Force | ForEach-Object {
 
 Copy-Item (Join-Path $ReleaseDir 'vand1.exe') (Join-Path $StagingDir 'vand1.exe') -Force
 
+# MySQL client OpenSSL deps (libmysql.dll needs these next to the exe)
+foreach ($dll in @('libmysql.dll', 'libssl-3-x64.dll', 'libcrypto-3-x64.dll')) {
+    $src = Join-Path $ReleaseDir $dll
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $StagingDir $dll) -Force
+        Write-Host "Applied MySQL runtime: $dll" -ForegroundColor DarkCyan
+    }
+}
+
 $staticDir = Join-Path $StagingDir 'static'
 New-Item -ItemType Directory -Path $staticDir -Force | Out-Null
 
@@ -70,7 +79,7 @@ foreach ($candidate in $echartsCandidates) {
 }
 
 # Overlay project-specific configs from release
-foreach ($cfg in @('config.json', 'device_backup.json', 'poll_config.txt', 'server.ini', 'mysql_config.ini')) {
+foreach ($cfg in @('config.json', 'device_backup.json', 'poll_config.txt', 'server.ini', 'mysql_config.ini', 'device_modify.ini')) {
     $src = Join-Path $ReleaseDir $cfg
     if (Test-Path $src) {
         Copy-Item $src (Join-Path $StagingDir $cfg) -Force

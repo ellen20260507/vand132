@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
+#include "esdeditpanel.h"
 #include "pollconfig.h"
 #include <QHBoxLayout>
 #include <QVBoxLayout>
@@ -179,13 +180,28 @@ MainWindow::MainWindow(QWidget *parent)
     // ===== 检查必要的环境文件 =====
     ui->textBrowser->append("[数据库] 检查必要的环境文件:");
 
-    // 1. 检查 libmysql.dll
+    // 1. 检查 libmysql.dll 及其 OpenSSL 依赖（MySQL 8 客户端必需）
     QString libmysqlPath = appDir + "/libmysql.dll";
     QFileInfo libmysqlFile(libmysqlPath);
     if (libmysqlFile.exists()) {
         ui->textBrowser->append("[数据库]   ✓ libmysql.dll 存在");
     } else {
         ui->textBrowser->append("[数据库]   ✗ libmysql.dll 缺失！");
+    }
+
+    QString libsslPath = appDir + "/libssl-3-x64.dll";
+    QString libcryptoPath = appDir + "/libcrypto-3-x64.dll";
+    QFileInfo libsslFile(libsslPath);
+    QFileInfo libcryptoFile(libcryptoPath);
+    if (libsslFile.exists()) {
+        ui->textBrowser->append("[数据库]   ✓ libssl-3-x64.dll 存在");
+    } else {
+        ui->textBrowser->append("[数据库]   ✗ libssl-3-x64.dll 缺失！（libmysql 依赖，常见导致 Driver not loaded）");
+    }
+    if (libcryptoFile.exists()) {
+        ui->textBrowser->append("[数据库]   ✓ libcrypto-3-x64.dll 存在");
+    } else {
+        ui->textBrowser->append("[数据库]   ✗ libcrypto-3-x64.dll 缺失！（libmysql 依赖，常见导致 Driver not loaded）");
     }
 
     // 2. 检查 Qt5Sql.dll
@@ -217,7 +233,8 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // 检查是否有缺失的文件
-    bool allFilesPresent = libmysqlFile.exists() && qt5SqlFile.exists() && mysqlDriverFile.exists() && configFile.exists();
+    bool allFilesPresent = libmysqlFile.exists() && libsslFile.exists() && libcryptoFile.exists()
+            && qt5SqlFile.exists() && mysqlDriverFile.exists() && configFile.exists();
     if (allFilesPresent) {
         ui->textBrowser->append("[数据库] ✓ 所有必要文件检查通过");
     } else {
@@ -260,8 +277,8 @@ MainWindow::MainWindow(QWidget *parent)
     if (!drivers.contains("QMYSQL")) {
         ui->textBrowser->append("[数据库]   ✗ QMYSQL 驱动不可用！");
         ui->textBrowser->append("[数据库]     - 可能原因: qsqlmysql.dll 与 Qt 版本不匹配");
-        ui->textBrowser->append("[数据库]     - 可能原因: libmysql.dll 版本不兼容");
-        ui->textBrowser->append("[数据库]     - 解决方法: 从 MySQL 安装目录复制 libmysql.dll");
+        ui->textBrowser->append("[数据库]     - 可能原因: libmysql.dll 缺少 OpenSSL 依赖（libssl-3-x64.dll / libcrypto-3-x64.dll）");
+        ui->textBrowser->append("[数据库]     - 解决方法: 从 MySQL 安装目录 bin 复制 libssl-3-x64.dll、libcrypto-3-x64.dll 到 exe 同级");
         ui->textBrowser->append("[数据库]     - 解决方法: 确保 qsqlmysql.dll 在 plugins/sqldrivers/ 目录");
     }
 
@@ -330,7 +347,7 @@ MainWindow::MainWindow(QWidget *parent)
         ui->textBrowser->append("[数据库]   2. 端口配置不正确（当前: " + QString::number(dbPort) + "）");
         ui->textBrowser->append("[数据库]   3. 用户凭证错误");
         ui->textBrowser->append("[数据库]   4. 目标数据库不存在");
-        ui->textBrowser->append("[数据库]   5. libmysql.dll 版本不兼容（尝试从MySQL安装目录复制）");
+        ui->textBrowser->append("[数据库]   5. libmysql.dll 缺少 OpenSSL 依赖（需 libssl-3-x64.dll / libcrypto-3-x64.dll 与 exe 同级）");
     }
 
     if (dbManagerInit) {
@@ -369,6 +386,9 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->action2, &QAction::triggered, this, &MainWindow::changemenu);
     connect(ui->actionmap, &QAction::triggered, this, &MainWindow::changemenu);
     connect(ui->action96, &QAction::triggered, this, &MainWindow::changemenu);
+    m_prevStackedPageIndex = ui->stackedWidget->currentIndex();
+    connect(ui->stackedWidget, &QStackedWidget::currentChanged,
+            this, &MainWindow::onStackedWidgetCurrentChanged);
     connect(ui->pushButton_3, &QPushButton::clicked, this, &MainWindow::onPushButton3Clicked);
     // UI控件连接（保留不变）
     connect(ui->btnSelectImage, &QPushButton::clicked, this, &MainWindow::onBtnSelectImageClicked);
@@ -764,174 +784,132 @@ void MainWindow::setupDeviceModifyUi()
     ui->layoutWidget2->hide();
     ui->textBrowser_2->hide();
     ui->chartWidget->hide();
-
-    const int top = 24;
-    const int left = 48;
-    const int btnWidth = 180;
-    const int btnHeight = 44;
-
-    m_btnDevModifyAddr = new QPushButton(QStringLiteral("地址修改"), ui->page_2);
-    m_btnDevModifyChannel = new QPushButton(QStringLiteral("通道修改"), ui->page_2);
-    m_btnDevModifyAddr->setGeometry(left, top, btnWidth, btnHeight);
-    m_btnDevModifyChannel->setGeometry(left + btnWidth + 12, top, btnWidth, btnHeight);
-
-    m_stackDevModify = new QStackedWidget(ui->page_2);
-    m_stackDevModify->setGeometry(left, top + btnHeight + 16, 1100, 780);
-
-    QWidget* addrPage = new QWidget(m_stackDevModify);
-    QHBoxLayout* addrRow = new QHBoxLayout;
-    m_leDisplayAddress = new QLineEdit(addrPage);
-    m_leDisplayAddress->setPlaceholderText(QStringLiteral("当前地址"));
-    m_btnAddrQuery = new QPushButton(QStringLiteral("查询"), addrPage);
-    m_leInputAddress = new QLineEdit(addrPage);
-    m_leInputAddress->setPlaceholderText(QStringLiteral("新地址"));
-    m_btnAddrApply = new QPushButton(QStringLiteral("应用"), addrPage);
-    addrRow->addWidget(m_leDisplayAddress, 2);
-    addrRow->addWidget(m_btnAddrQuery);
-    addrRow->addWidget(m_leInputAddress, 2);
-    addrRow->addWidget(m_btnAddrApply);
-    m_tbAddrLog = new QTextBrowser(addrPage);
-    QVBoxLayout* addrLayout = new QVBoxLayout(addrPage);
-    addrLayout->addLayout(addrRow);
-    addrLayout->addWidget(m_tbAddrLog, 1);
-
-    QWidget* channelPage = new QWidget(m_stackDevModify);
-    QVBoxLayout* channelLayout = new QVBoxLayout(channelPage);
-    channelLayout->setContentsMargins(0, 0, 0, 0);
-
-    ui->layoutWidget1->setParent(channelPage);
-    ui->verticalLayout_6->setSpacing(18);
-    ui->verticalLayout_6->setContentsMargins(0, 0, 0, 0);
-
-    const QList<QLabel*> hiddenLabels = {
-        ui->label_12, ui->label_13, ui->label_14, ui->label_15,
-        ui->label_16, ui->label_18, ui->label_19, ui->label_20
-    };
-    for (QLabel* label : hiddenLabels) {
-        if (label) {
-            label->hide();
-            label->setFixedWidth(0);
-            label->setMaximumWidth(0);
-        }
+    if (ui->layoutWidget1) {
+        ui->layoutWidget1->hide();
     }
 
-    ui->lineEdit_5->setPlaceholderText(QStringLiteral("地址"));
-    ui->lineEdit_6->setPlaceholderText(QStringLiteral("通道"));
-    ui->lineEdit_7->setPlaceholderText(QStringLiteral("状态"));
-    ui->lineEdit_7->setReadOnly(true);
-    ui->lineEdit_8->setPlaceholderText(QStringLiteral("地址"));
-    ui->lineEdit_9->setPlaceholderText(QStringLiteral("通道"));
-    ui->lineEdit_10->setPlaceholderText(QStringLiteral("设置状态(0/1)"));
+    QVBoxLayout* pageLayout = new QVBoxLayout(ui->page_2);
+    pageLayout->setContentsMargins(16, 16, 16, 16);
+    pageLayout->setSpacing(12);
 
-    const QList<QHBoxLayout*> formRows = {
-        ui->horizontalLayout_13, ui->horizontalLayout_14, ui->horizontalLayout_20,
-        ui->horizontalLayout_15, ui->horizontalLayout_16, ui->horizontalLayout_17,
-        ui->horizontalLayout_21, ui->horizontalLayout_19
-    };
-    for (QHBoxLayout* row : formRows) {
-        if (row && row->count() >= 2) {
-            row->setStretch(1, 3);
-        }
-    }
+    m_esdEditPanel = new EsdEditPanel(ui->page_2);
+    pageLayout->addWidget(m_esdEditPanel);
 
-    ui->pushButton_5->setParent(channelPage);
-    ui->pushButton_6->setParent(channelPage);
-    ui->pushButton_5->setText(QStringLiteral("查询"));
-    ui->pushButton_6->setText(QStringLiteral("修改"));
-
-    QHBoxLayout* channelBtnRow = new QHBoxLayout;
-    channelBtnRow->addWidget(ui->pushButton_5);
-    channelBtnRow->addWidget(ui->pushButton_6);
-    channelBtnRow->addStretch(1);
-
-    channelLayout->addWidget(ui->layoutWidget1, 1);
-    channelLayout->addLayout(channelBtnRow);
-
-    m_stackDevModify->addWidget(addrPage);
-    m_stackDevModify->addWidget(channelPage);
-
-    connect(m_btnDevModifyAddr, &QPushButton::clicked, this, [this]() {
-        m_stackDevModify->setCurrentIndex(0);
-        updateDeviceModifyModeButtons();
+    m_esdEditPanel->setConnectionChecker([this]() {
+        return getToolSerialWorker() != nullptr;
     });
-    connect(m_btnDevModifyChannel, &QPushButton::clicked, this, [this]() {
-        m_stackDevModify->setCurrentIndex(1);
-        updateDeviceModifyModeButtons();
-    });
-    connect(m_btnAddrQuery, &QPushButton::clicked, this, &MainWindow::onDevModifyAddrQuery);
-    connect(m_btnAddrApply, &QPushButton::clicked, this, &MainWindow::onDevModifyAddrApply);
+    connect(m_esdEditPanel, &EsdEditPanel::frameSendRequested,
+            this, &MainWindow::onEsdEditFrameSend);
 
-    updateDeviceModifyModeButtons();
+    setDeviceModifyInteractionEnabled(false);
     applyDeviceModifyPageStyle();
+}
+
+QString MainWindow::loadDeviceModifyPassword() const
+{
+    const QString iniPath = QCoreApplication::applicationDirPath() + QStringLiteral("/device_modify.ini");
+    QSettings settings(iniPath, QSettings::IniFormat);
+    settings.setIniCodec("UTF-8");
+    const QString password = settings.value(QStringLiteral("DeviceModify/password"),
+                                          QStringLiteral("888888")).toString();
+    return password;
+}
+
+void MainWindow::setDeviceModifyInteractionEnabled(bool enabled)
+{
+    if (m_esdEditPanel) {
+        m_esdEditPanel->setEnabled(enabled);
+    }
+}
+
+void MainWindow::onStackedWidgetCurrentChanged(int index)
+{
+    if (m_prevStackedPageIndex == kDeviceModifyPageIndex && index != kDeviceModifyPageIndex) {
+        m_deviceModifyUnlocked = false;
+        setDeviceModifyInteractionEnabled(false);
+    }
+
+    if (index == kDeviceModifyPageIndex) {
+        QTimer::singleShot(0, this, &MainWindow::promptDeviceModifyPassword);
+    }
+
+    m_prevStackedPageIndex = index;
+}
+
+void MainWindow::promptDeviceModifyPassword()
+{
+    if (!m_esdEditPanel || ui->stackedWidget->currentIndex() != kDeviceModifyPageIndex) {
+        return;
+    }
+
+    m_deviceModifyUnlocked = false;
+    setDeviceModifyInteractionEnabled(false);
+
+    const QString correctPassword = loadDeviceModifyPassword();
+
+    while (ui->stackedWidget->currentIndex() == kDeviceModifyPageIndex) {
+        bool ok = false;
+        const QString input = QInputDialog::getText(
+            this,
+            QStringLiteral("设备修改验证"),
+            QStringLiteral("请输入设备修改密码："),
+            QLineEdit::Password,
+            QString(),
+            &ok);
+
+        if (!ok) {
+            return;
+        }
+
+        if (input == correctPassword) {
+            m_deviceModifyUnlocked = true;
+            setDeviceModifyInteractionEnabled(true);
+            return;
+        }
+
+        QMessageBox::warning(this,
+                             QStringLiteral("密码错误"),
+                             QStringLiteral("密码不正确，请重新输入。"));
+    }
 }
 
 void MainWindow::applyDeviceModifyPageStyle()
 {
-    if (!m_stackDevModify) {
+    if (!m_esdEditPanel) {
         return;
     }
 
-    const int controlHeight = 44;
-    const int inputMinWidth = 280;
-    const int resultMinWidth = 420;
-    const QSize expandSize(16777215, 16777215);
-
-    if (ui->layoutWidget1) {
-        ui->layoutWidget1->setMinimumWidth(720);
+    if (ui->page_2) {
+        ui->page_2->setStyleSheet(QStringLiteral("QWidget#page_2 { background-color: #f5f7fb; }"));
     }
 
-    applyAdminPanelControlSizes(m_stackDevModify, inputMinWidth, controlHeight);
-
-    const QList<QLineEdit*> wideResultFields = {
-        ui->lineEdit_7, m_leDisplayAddress, m_leInputAddress
-    };
-    for (QLineEdit* lineEdit : wideResultFields) {
-        if (!lineEdit) {
-            continue;
-        }
-        lineEdit->setMaximumSize(expandSize);
-        lineEdit->setMinimumWidth(resultMinWidth);
-        lineEdit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    }
-
-    for (QLineEdit* lineEdit : m_stackDevModify->findChildren<QLineEdit*>()) {
-        if (lineEdit == ui->lineEdit_7) {
-            continue;
-        }
-        lineEdit->setMaximumSize(expandSize);
-        lineEdit->setMinimumWidth(qMax(lineEdit->minimumWidth(), inputMinWidth));
-    }
-
-    for (QComboBox* comboBox : m_stackDevModify->findChildren<QComboBox*>()) {
-        comboBox->setMinimumWidth(160);
-        comboBox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    }
-
-    for (QPushButton* button : m_stackDevModify->findChildren<QPushButton*>()) {
-        button->setMinimumHeight(controlHeight);
-        button->setMinimumWidth(120);
-    }
+    applyAdminPanelFont(m_esdEditPanel);
 }
 
-void MainWindow::updateDeviceModifyModeButtons()
+void MainWindow::onEsdEditFrameSend(const QByteArray& frame, const QString& expectedFunc)
 {
-    if (!m_btnDevModifyAddr || !m_btnDevModifyChannel || !m_stackDevModify) {
+    if (!m_deviceModifyUnlocked) {
+        if (m_esdEditPanel) {
+            m_esdEditPanel->handleToolFailed(QStringLiteral("请先输入设备修改密码"));
+        }
         return;
     }
-    const bool addrMode = m_stackDevModify->currentIndex() == 0;
-    m_btnDevModifyAddr->setStyleSheet(addrMode
-        ? QStringLiteral("background-color:#165dff;color:#fff;border-radius:6px;")
-        : QStringLiteral("background-color:#e5e6eb;color:#1d2129;border-radius:6px;"));
-    m_btnDevModifyChannel->setStyleSheet(!addrMode
-        ? QStringLiteral("background-color:#165dff;color:#fff;border-radius:6px;")
-        : QStringLiteral("background-color:#e5e6eb;color:#1d2129;border-radius:6px;"));
+
+    SerialWorker* worker = getToolSerialWorker();
+    if (!worker) {
+        if (m_esdEditPanel) {
+            m_esdEditPanel->handleToolFailed(QStringLiteral("请先在连接设置中连接串口"));
+        }
+        return;
+    }
+
+    m_toolContext = ToolCommandContext::EsdEdit;
+    m_activeToolWorker = worker;
+    worker->sendToolCommand(frame, expectedFunc);
 }
 
 SerialWorker* MainWindow::getToolSerialWorker() const
 {
-    if (ui->comboBox_connection_type->currentIndex() != 0) {
-        return nullptr;
-    }
     if (m_worker2 && m_worker2->isConnectionOpen()) {
         return m_worker2;
     }
@@ -977,8 +955,14 @@ bool MainWindow::sendToolFrame(const QString& hexPayload, const QString& expecte
 
 void MainWindow::onToolCommandFailed(const QString& reason)
 {
+    const ToolCommandContext context = m_toolContext;
     m_toolContext = ToolCommandContext::None;
     m_activeToolWorker = nullptr;
+
+    if (context == ToolCommandContext::EsdEdit && m_esdEditPanel) {
+        m_esdEditPanel->handleToolFailed(reason);
+        return;
+    }
     QMessageBox::warning(this, QStringLiteral("提示"), reason);
 }
 
@@ -1011,65 +995,14 @@ void MainWindow::onToolCommandCompleted(const QByteArray& frame, const QString& 
     case ToolCommandContext::DeviceTestApply:
         ui->lineEdit_10->setText(QStringLiteral("已写入"));
         break;
-    case ToolCommandContext::AddrQuery:
-        if (m_leDisplayAddress) {
-            const int addressDec = hexStr.left(4).toInt(nullptr, 16);
-            m_leDisplayAddress->setText(QString::number(addressDec));
-        }
-        if (m_tbAddrLog) {
-            m_tbAddrLog->append(QStringLiteral("[接收] %1").arg(hexStr));
-        }
-        break;
-    case ToolCommandContext::AddrApply:
-        if (m_tbAddrLog) {
-            m_tbAddrLog->append(QStringLiteral("[接收] %1 — 地址写入成功").arg(hexStr));
+    case ToolCommandContext::EsdEdit:
+        if (m_esdEditPanel) {
+            m_esdEditPanel->handleToolResponse(frame, expectedFuncCode);
         }
         break;
     default:
         break;
     }
-}
-
-void MainWindow::onDevModifyAddrQuery()
-{
-    if (m_tbAddrLog) {
-        m_tbAddrLog->append(QStringLiteral("[发送] FFFF010100000001"));
-    }
-    sendToolFrame(QStringLiteral("FFFF010100000001"), QStringLiteral("0101"), ToolCommandContext::AddrQuery);
-}
-
-void MainWindow::onDevModifyAddrApply()
-{
-    QString hexAddr;
-    bool addrOk = false;
-    const int displayAddr = m_leDisplayAddress ? m_leDisplayAddress->text().toInt(&addrOk) : 0;
-    if (!addrOk || displayAddr <= 0) {
-        hexAddr = QStringLiteral("FFFF");
-    } else {
-        hexAddr = QString("%1").arg(displayAddr, 4, 16, QChar('0')).toUpper();
-    }
-
-    if (hexAddr == QLatin1String("FFFF")) {
-        const QMessageBox::StandardButton reply = QMessageBox::warning(
-            this, QStringLiteral("确认操作"),
-            QStringLiteral("此操作会修改该端口连接的所有设备，请手动确认此操作"),
-            QMessageBox::Ok | QMessageBox::Cancel);
-        if (reply != QMessageBox::Ok) {
-            return;
-        }
-    }
-
-    bool inputOk = false;
-    int inputValue = m_leInputAddress ? m_leInputAddress->text().toInt(&inputOk) : 0;
-    if (!inputOk || inputValue < 0) {
-        inputValue = 0;
-    }
-    const QString hexValue = QString("%1").arg(inputValue, 4, 16, QChar('0')).toUpper();
-    const QString modbusStr = hexAddr + QStringLiteral("000100000001") + hexValue;
-    if (m_tbAddrLog) {
-        m_tbAddrLog->append(QStringLiteral("[应用] %1").arg(modbusStr));
-    }
-    sendToolFrame(modbusStr, QStringLiteral("0001"), ToolCommandContext::AddrApply);
 }
 
 void MainWindow::restoreFromConfig()
@@ -1131,8 +1064,8 @@ void MainWindow::restoreFromConfig()
             dev->setPos(QPoint(devConfig.x, devConfig.y));
             dev->hide();
 
-            // 连接双击事件信号
-            connect(dev, &DeviceWidget::deviceDoubleClicked, this, &MainWindow::onDeviceDoubleClicked);
+            // 连接选中信号
+            wireDeviceSelectionSignals(dev);
 
             currentData.devices.append(dev);
 
@@ -1695,7 +1628,7 @@ void MainWindow::changemenu()
     }
     else if(triggeredAction->objectName() == "action2"){
         ui->stackedWidget->setCurrentIndex(2); // page_2：设备修改（index 1 为已清空的 page_3）
-        updateDeviceModifyModeButtons();
+        applyDeviceModifyPageStyle();
     }
     else if(triggeredAction->objectName() == "actionmap"){
         ui->stackedWidget->setCurrentIndex(3);
@@ -2403,19 +2336,149 @@ void MainWindow::onSingleTestClicked()
         sendNextData();
     }
 }
-void MainWindow::onDeviceDoubleClicked(DeviceWidget* device)
+void MainWindow::clearDeviceSelection()
 {
-    // 如果之前有选中的设备，取消选中
-    if (m_selectedDevice && m_selectedDevice != device) {
-        m_selectedDevice->setSelected(false);
+    for (DeviceWidget* device : m_selectedDevices) {
+        if (device) {
+            device->setSelected(false);
+        }
+    }
+    m_selectedDevices.clear();
+}
+
+void MainWindow::wireDeviceSelectionSignals(DeviceWidget* device)
+{
+    if (!device) {
+        return;
+    }
+    connect(device, &DeviceWidget::deviceClicked, this, &MainWindow::onDeviceClicked);
+    connect(device, &DeviceWidget::deviceDoubleClicked, this, &MainWindow::onDeviceDoubleClicked);
+}
+
+void MainWindow::onDeviceClicked(DeviceWidget* device, bool ctrlPressed)
+{
+    if (!device) {
+        return;
     }
 
-    // 设置新的选中设备
-    m_selectedDevice = device;
-    m_selectedDevice->setSelected(true);
+    if (ctrlPressed) {
+        if (m_selectedDevices.contains(device)) {
+            m_selectedDevices.remove(device);
+            device->setSelected(false);
+        } else {
+            m_selectedDevices.insert(device);
+            device->setSelected(true);
+        }
+    } else {
+        clearDeviceSelection();
+        m_selectedDevices.insert(device);
+        device->setSelected(true);
+    }
 
-    writeCrashLog(QString("[Device] 双击选中设备：%1").arg(device->getId()));
-    ui->textBrowser_2->append(QString("已选中设备：%1").arg(device->getId()));
+    QStringList ids;
+    for (DeviceWidget* selected : m_selectedDevices) {
+        if (selected) {
+            ids.append(selected->getId());
+        }
+    }
+    ids.sort();
+    writeCrashLog(QString("[Device] 选中设备：%1").arg(ids.isEmpty() ? QStringLiteral("(无)") : ids.join(",")));
+    if (ui->textBrowser_2) {
+        ui->textBrowser_2->append(ids.isEmpty()
+            ? QStringLiteral("已取消选中")
+            : QStringLiteral("已选中设备：%1").arg(ids.join(", ")));
+    }
+}
+
+void MainWindow::onDeviceDoubleClicked(DeviceWidget* device)
+{
+    // 双击保持为单选，便于沿用旧操作习惯
+    onDeviceClicked(device, false);
+}
+
+bool MainWindow::deleteSelectedMapDevices(bool showSuccessBox)
+{
+    if (m_currentImageIndex == -1 || m_currentImageIndex >= m_imageDeviceList.size()) {
+        QMessageBox::warning(this, "警告", "请先选择图片！");
+        return false;
+    }
+
+    if (m_selectedDevices.isEmpty()) {
+        QMessageBox::information(this, "提示",
+            "请先单击选择要删除的设备！\n按住 Ctrl 再单击可多选。");
+        writeCrashLog("[Device] 删除设备失败：未选中设备");
+        return false;
+    }
+
+    auto& devices = m_imageDeviceList[m_currentImageIndex].devices;
+    QList<DeviceWidget*> toDelete;
+    for (DeviceWidget* device : m_selectedDevices) {
+        if (device && devices.contains(device)) {
+            toDelete.append(device);
+        }
+    }
+
+    if (toDelete.isEmpty()) {
+        clearDeviceSelection();
+        QMessageBox::warning(this, "警告", "当前图片没有可删除的选中设备！");
+        return false;
+    }
+
+    QStringList ids;
+    for (DeviceWidget* device : toDelete) {
+        ids.append(device->getId());
+    }
+    ids.sort();
+
+    const QString confirmText = (toDelete.size() == 1)
+        ? QStringLiteral("确定删除设备「%1」？").arg(ids.first())
+        : QStringLiteral("确定删除已选的 %1 个设备？\n%2").arg(toDelete.size()).arg(ids.join(", "));
+    if (QMessageBox::question(this, "确认删除", confirmText,
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        writeCrashLog(QString("[Device] 取消删除设备：%1").arg(ids.join(",")));
+        return false;
+    }
+
+    int removedCount = 0;
+    for (DeviceWidget* device : toDelete) {
+        if (!devices.removeOne(device)) {
+            continue;
+        }
+
+        const QString deviceType = device->getType();
+        const QString deviceId = device->getId();
+        const int idNumber = deviceId.mid(1).toInt();
+        m_deletedDeviceIds[deviceType].insert(idNumber);
+        m_selectedDevices.remove(device);
+
+        disconnect(device, &DeviceWidget::deviceClicked, this, &MainWindow::onDeviceClicked);
+        disconnect(device, &DeviceWidget::deviceDoubleClicked, this, &MainWindow::onDeviceDoubleClicked);
+
+        device->hide();
+        device->deleteLater();
+        ++removedCount;
+
+        writeCrashLog(QString("[Device] 删除设备成功：%1，类型：%2，ID编号：%3")
+                     .arg(deviceId).arg(deviceType).arg(idNumber));
+    }
+
+    clearDeviceSelection();
+
+    if (removedCount <= 0) {
+        QMessageBox::warning(this, "警告", "删除设备失败！");
+        writeCrashLog("[Device] 删除设备失败：未能移除选中设备");
+        return false;
+    }
+
+    if (ui->textBrowser_2) {
+        ui->textBrowser_2->append(QStringLiteral("已删除 %1 个设备：%2")
+                                  .arg(removedCount).arg(ids.join(", ")));
+    }
+    if (showSuccessBox) {
+        QMessageBox::information(this, "成功",
+            QStringLiteral("已删除 %1 个设备。").arg(removedCount));
+    }
+    return true;
 }
 
 void MainWindow::updateIonizerStatus(const QString& deviceId, bool isOnline)
@@ -2554,54 +2617,10 @@ void MainWindow::syncPollConfigToWorkers(const QVector<QStringList>& tableData)
 
 void MainWindow::onPushButtonDeleteClicked()
 {
-    ui->textBrowser_2->clear();
-
-    // 检查是否有选中的设备
-    if (!m_selectedDevice) {
-        QMessageBox::information(this, "提示", "请先双击选择要删除的设备！");
-        writeCrashLog("[Device] 删除设备失败：未选中设备");
-        return;
+    if (ui->textBrowser_2) {
+        ui->textBrowser_2->clear();
     }
-
-    // 确认删除
-    int ret = QMessageBox::question(this, "确认删除",
-                                   QString("确定要删除设备 %1 吗？").arg(m_selectedDevice->getId()),
-                                   QMessageBox::Yes | QMessageBox::No);
-    if (ret != QMessageBox::Yes) {
-        writeCrashLog(QString("[Device] 取消删除设备：%1").arg(m_selectedDevice->getId()));
-        return;
-    }
-
-    // 从当前图片的设备列表中删除设备
-    if (m_currentImageIndex == -1 || m_currentImageIndex >= m_imageDeviceList.size()) {
-        QMessageBox::warning(this, "警告", "当前没有有效的图片！");
-        return;
-    }
-
-    ImageDeviceData& currentData = m_imageDeviceList[m_currentImageIndex];
-    bool removed = currentData.devices.removeOne(m_selectedDevice);
-
-    if (removed) {
-        // 记录已删除的设备ID（用于后续重新分配）
-        QString deviceType = m_selectedDevice->getType();
-        QString deviceId = m_selectedDevice->getId();
-        int idNumber = deviceId.mid(1).toInt(); // 提取数字部分，如W1 -> 1
-
-        m_deletedDeviceIds[deviceType].insert(idNumber);
-
-        writeCrashLog(QString("[Device] 删除设备成功：%1，类型：%2，ID编号：%3")
-                     .arg(deviceId).arg(deviceType).arg(idNumber));
-
-        // 删除设备控件
-        m_selectedDevice->hide();
-        m_selectedDevice->deleteLater();
-        m_selectedDevice = nullptr;
-
-        ui->textBrowser_2->append(QString("设备 %1 已删除").arg(deviceId));
-    } else {
-        QMessageBox::warning(this, "警告", "删除设备失败！");
-        writeCrashLog(QString("[Device] 删除设备失败：%1").arg(m_selectedDevice->getId()));
-    }
+    deleteSelectedMapDevices(false);
 }
 
 QVector<QStringList> MainWindow::getPollConfigRows()
@@ -2723,7 +2742,7 @@ DeviceWidget* MainWindow::createMapDevice(const QString& type, const QString& de
 
     dev->setPos(pos);
     dev->show();
-    connect(dev, &DeviceWidget::deviceDoubleClicked, this, &MainWindow::onDeviceDoubleClicked);
+    wireDeviceSelectionSignals(dev);
     m_imageDeviceList[m_currentImageIndex].devices.append(dev);
     return dev;
 }
@@ -2872,6 +2891,7 @@ void MainWindow::switchToImage(int index)
         return;
     }
 
+    clearDeviceSelection();
     clearCurrentDevices();
     m_currentImageIndex = index;
     const ImageDeviceData& targetData = m_imageDeviceList[index];
@@ -2987,6 +3007,7 @@ void MainWindow::onImageListCurrentIndexChanged(int index)
 {
     if (index == 0) {
         // 选择了默认提示项，清空显示
+        clearDeviceSelection();
         clearCurrentDevices();
         m_currentImageIndex = -1;
         ui->labelImage->clear();
@@ -3208,6 +3229,7 @@ void MainWindow::onBtnDeleteClicked()
     }
 
     // 清理设备
+    clearDeviceSelection();
     const ImageDeviceData& targetData = m_imageDeviceList[m_currentImageIndex];
     for (DeviceWidget* dev : targetData.devices) {
         if (dev) {
@@ -3246,58 +3268,7 @@ void MainWindow::onBtnDeleteClicked()
 }
 // 删除选中的设备（按钮名：btnDelete_2）
 void MainWindow::on_btnDelete_2_clicked() {
-    // 1. 检查是否选择图片
-    if (m_currentImageIndex == -1 || m_currentImageIndex >= m_imageDeviceList.size()) {
-        QMessageBox::warning(this, "警告", "请先选择图片！");
-        return;
-    }
-
-    // 2. 检查是否有选中的设备
-    if (!m_selectedDevice) {
-        QMessageBox::information(this, "提示", "请先双击选择要删除的设备！");
-        writeCrashLog("[Device] 删除设备失败：未选中设备");
-        return;
-    }
-
-    // 3. 检查当前图片是否有设备
-    auto& devices = m_imageDeviceList[m_currentImageIndex].devices;
-    if (devices.isEmpty()) {
-        QMessageBox::warning(this, "警告", "当前图片没有设备可删除！");
-        return;
-    }
-
-    // 4. 二次确认
-    if (QMessageBox::question(this, "确认", QString("删除选中的设备「%1」？").arg(m_selectedDevice->getId())) != QMessageBox::Yes) {
-        writeCrashLog(QString("[Device] 取消删除设备：%1").arg(m_selectedDevice->getId()));
-        return;
-    }
-
-    // 5. 删除选中的设备
-    bool removed = devices.removeOne(m_selectedDevice);
-
-    if (removed) {
-        // 记录已删除的设备ID（用于后续重新分配）
-        QString deviceType = m_selectedDevice->getType();
-        QString deviceId = m_selectedDevice->getId();
-        int idNumber = deviceId.mid(1).toInt(); // 提取数字部分，如W1 -> 1
-
-        m_deletedDeviceIds[deviceType].insert(idNumber);
-
-        writeCrashLog(QString("[Device] 删除设备成功：%1，类型：%2，ID编号：%3")
-                     .arg(deviceId).arg(deviceType).arg(idNumber));
-
-        // 断开信号连接并删除设备控件
-        disconnect(m_selectedDevice, &DeviceWidget::deviceDoubleClicked, this, &MainWindow::onDeviceDoubleClicked);
-
-        m_selectedDevice->hide();
-        m_selectedDevice->deleteLater();
-        m_selectedDevice = nullptr;
-
-        QMessageBox::information(this, "成功", "选中的设备已删除！");
-    } else {
-        QMessageBox::warning(this, "警告", "删除设备失败！");
-        writeCrashLog(QString("[Device] 删除设备失败：%1").arg(m_selectedDevice->getId()));
-    }
+    deleteSelectedMapDevices(true);
 }
 bool MainWindow::backupDevices() {
     QJsonObject root;
@@ -3425,7 +3396,8 @@ bool MainWindow::restoreDevices() {
         dev->setPos(QPoint(x, y));
         dev->hide();
 
-        // 连接信号
+        wireDeviceSelectionSignals(dev);
+
         // 添加到设备列表并标记已存在
         m_imageDeviceList[imgIndex].devices.append(dev);
         existingDeviceIds.insert(deviceUniqueKey);

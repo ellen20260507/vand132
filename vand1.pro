@@ -24,6 +24,7 @@ include($$PWD/httpserver/httpserver.pri)
 SOURCES += \
     configmanager.cpp \
     dbmanager.cpp \
+    esdeditpanel.cpp \
     main.cpp \
     mainwindow.cpp \
     newdialog.cpp \
@@ -34,6 +35,7 @@ SOURCES += \
 HEADERS += \
     configmanager.h \
     dbmanager.h \
+    esdeditpanel.h \
     mainwindow.h \
     newdialog.h \
     myrequesthandler.h \
@@ -43,6 +45,7 @@ HEADERS += \
     placement_new.h \
     placement_new_global.h
 FORMS += \
+    esdeditpanel.ui \
     mainwindow.ui \
     newdialog.ui \
     myrequesthandler.ui

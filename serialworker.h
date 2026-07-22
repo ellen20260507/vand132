@@ -51,6 +51,7 @@ public:
 
     bool isConnectionOpen() const;
     void sendToolCommand(const QByteArray& data, const QString& expectedFuncCode);
+    void sendRawBytes(const QByteArray& data);
 
 signals:
     void logGenerated(const QString& workerName, const QString& log);

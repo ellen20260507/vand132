@@ -1586,6 +1586,163 @@ void DBManager::writeLogToFile(const QString& workerName, const QString& message
     }
 }
 
+QString DBManager::buildMesReadingsWhereClause(const MesReadingQueryFilter& filter, QStringList& bindKeys) const
+{
+    QStringList clauses;
+    clauses << QStringLiteral("pc.enabled = 1");
+    clauses << QStringLiteral("pd.enabled = 1");
+
+    if (!filter.allModbusAddrs && !filter.modbusAddrs.isEmpty()) {
+        QStringList placeholders;
+        for (int i = 0; i < filter.modbusAddrs.size(); ++i) {
+            const QString key = QStringLiteral("modbusAddr%1").arg(i);
+            placeholders << QStringLiteral(":") + key;
+            bindKeys.append(key);
+        }
+        clauses << QStringLiteral("pd.modbus_addr IN (%1)").arg(placeholders.join(QStringLiteral(", ")));
+    }
+
+    if (!filter.allTypes && !filter.channelTypes.isEmpty()) {
+        QStringList placeholders;
+        for (int i = 0; i < filter.channelTypes.size(); ++i) {
+            const QString key = QStringLiteral("channelType%1").arg(i);
+            placeholders << QStringLiteral(":") + key;
+            bindKeys.append(key);
+        }
+        clauses << QStringLiteral("pc.channel_type IN (%1)").arg(placeholders.join(QStringLiteral(", ")));
+    }
+
+    if (!filter.allChannels && !filter.channelNos.isEmpty()) {
+        QStringList placeholders;
+        for (int i = 0; i < filter.channelNos.size(); ++i) {
+            const QString key = QStringLiteral("channelNo%1").arg(i);
+            placeholders << QStringLiteral(":") + key;
+            bindKeys.append(key);
+        }
+        clauses << QStringLiteral("pc.channel_no IN (%1)").arg(placeholders.join(QStringLiteral(", ")));
+    }
+
+    if (filter.hasStartTime) {
+        clauses << QStringLiteral("cr.record_time >= :startTime");
+        bindKeys.append(QStringLiteral("startTime"));
+    }
+    if (filter.hasEndTime) {
+        clauses << QStringLiteral("cr.record_time <= :endTime");
+        bindKeys.append(QStringLiteral("endTime"));
+    }
+
+    return clauses.join(QStringLiteral(" AND "));
+}
+
+void DBManager::bindMesReadingsFilter(QSqlQuery& query, const MesReadingQueryFilter& filter,
+                                      const QStringList& bindKeys) const
+{
+    int modbusIndex = 0;
+    int typeIndex = 0;
+    int channelIndex = 0;
+
+    for (const QString& key : bindKeys) {
+        if (key.startsWith(QStringLiteral("modbusAddr"))) {
+            query.bindValue(QStringLiteral(":") + key, filter.modbusAddrs.at(modbusIndex++));
+        } else if (key.startsWith(QStringLiteral("channelType"))) {
+            query.bindValue(QStringLiteral(":") + key, filter.channelTypes.at(typeIndex++));
+        } else if (key.startsWith(QStringLiteral("channelNo"))) {
+            query.bindValue(QStringLiteral(":") + key, filter.channelNos.at(channelIndex++));
+        } else if (key == QStringLiteral("startTime")) {
+            query.bindValue(QStringLiteral(":startTime"), filter.startTime);
+        } else if (key == QStringLiteral("endTime")) {
+            query.bindValue(QStringLiteral(":endTime"), filter.endTime);
+        }
+    }
+}
+
+MesReadingQueryResult DBManager::queryMesReadings(const MesReadingQueryFilter& filter)
+{
+    MesReadingQueryResult result;
+    result.appliedFilter = filter;
+
+    QMutexLocker locker(&m_readMutex);
+    if (!ensureReadConnection()) {
+        result.errorCode = QStringLiteral("DB_UNAVAILABLE");
+        result.errorMessage = QStringLiteral("数据库连接不可用");
+        return result;
+    }
+
+    QStringList bindKeys;
+    const QString whereClause = buildMesReadingsWhereClause(filter, bindKeys);
+    const int page = filter.allPageSize ? 1 : qMax(1, filter.page);
+    const int pageSize = filter.allPageSize ? 0 : qMax(1, filter.pageSize);
+    const int offset = filter.allPageSize ? 0 : (page - 1) * pageSize;
+
+    QSqlQuery countQuery(m_readDb);
+    const QString countSql = QStringLiteral(
+        "SELECT COUNT(*) FROM channel_reading cr "
+        "INNER JOIN poll_channel pc ON cr.channel_id = pc.id "
+        "INNER JOIN poll_device pd ON cr.device_id = pd.id "
+        "WHERE %1").arg(whereClause);
+    countQuery.prepare(countSql);
+    bindMesReadingsFilter(countQuery, filter, bindKeys);
+
+    if (!countQuery.exec() || !countQuery.next()) {
+        result.errorCode = QStringLiteral("QUERY_FAILED");
+        result.errorMessage = countQuery.lastError().text();
+        return result;
+    }
+
+    result.total = countQuery.value(0).toInt();
+
+    bindKeys.clear();
+    const QString whereClauseData = buildMesReadingsWhereClause(filter, bindKeys);
+
+    QSqlQuery dataQuery(m_readDb);
+    QString dataSql = QStringLiteral(
+        "SELECT pc.point_id, cr.record_time, cr.value_num, cr.status_desc "
+        "FROM channel_reading cr "
+        "INNER JOIN poll_channel pc ON cr.channel_id = pc.id "
+        "INNER JOIN poll_device pd ON cr.device_id = pd.id "
+        "WHERE %1 "
+        "ORDER BY cr.record_time ASC, pd.modbus_addr ASC, pc.channel_type ASC, pc.channel_no ASC, cr.id ASC").arg(whereClauseData);
+    if (!filter.allPageSize) {
+        dataSql += QStringLiteral(" LIMIT :limit OFFSET :offset");
+    }
+    dataQuery.prepare(dataSql);
+    bindMesReadingsFilter(dataQuery, filter, bindKeys);
+    if (!filter.allPageSize) {
+        dataQuery.bindValue(QStringLiteral(":limit"), pageSize);
+        dataQuery.bindValue(QStringLiteral(":offset"), offset);
+    }
+
+    if (!dataQuery.exec()) {
+        result.errorCode = QStringLiteral("QUERY_FAILED");
+        result.errorMessage = dataQuery.lastError().text();
+        return result;
+    }
+
+    while (dataQuery.next()) {
+        MesReadingRow row;
+        row.pointId = dataQuery.value(QStringLiteral("point_id")).toString();
+        row.recordTime = dataQuery.value(QStringLiteral("record_time")).toDateTime();
+        if (dataQuery.value(QStringLiteral("value_num")).isNull()) {
+            row.hasValueNum = false;
+        } else {
+            row.hasValueNum = true;
+            row.valueNum = dataQuery.value(QStringLiteral("value_num")).toDouble();
+        }
+        row.statusDesc = dataQuery.value(QStringLiteral("status_desc")).toString();
+        result.items.append(row);
+    }
+
+    result.success = true;
+    result.appliedFilter.page = page;
+    if (filter.allPageSize) {
+        result.appliedFilter.allPageSize = true;
+        result.appliedFilter.pageSize = result.total;
+    } else {
+        result.appliedFilter.pageSize = pageSize;
+    }
+    return result;
+}
+
 class DBManager::AsyncQueryTask : public QRunnable
 {
 public:

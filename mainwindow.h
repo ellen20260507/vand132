@@ -18,11 +18,13 @@
 #include <QJsonObject>
 #include <QPoint>
 #include <QList>
+#include <QSet>
 #include <QtMath>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QDir>
 #include <QFileDialog>
+#include <QLineEdit>
 #include "pollconfig.h"
 #include "uistyle.h"
 #include <QPixmap>
@@ -89,11 +91,16 @@ public:
     QMap<QString, QList<QString>> getAddressFuncData() const { return addressFuncData; }
 signals:
     void posChanged(); // 设备位置改变时触发
-    void deviceDoubleClicked(DeviceWidget* device); // 新增：双击事件信号
+    void deviceClicked(DeviceWidget* device, bool ctrlPressed); // 单击选中（Ctrl 多选）
+    void deviceDoubleClicked(DeviceWidget* device); // 双击：单选该设备
 
 protected:
     void mousePressEvent(QMouseEvent* e) override {
-        if (e->button() == Qt::LeftButton) m_offset = e->pos();
+        if (e->button() == Qt::LeftButton) {
+            m_offset = e->pos();
+            const bool ctrl = e->modifiers().testFlag(Qt::ControlModifier);
+            emit deviceClicked(this, ctrl);
+        }
     }
     void mouseMoveEvent(QMouseEvent* e) override {
         if (e->buttons() & Qt::LeftButton) {
@@ -154,13 +161,13 @@ struct ImageDeviceData {
 };
 
 class SerialWorker;
+class EsdEditPanel;
 
 enum class ToolCommandContext {
     None,
     DeviceTestQuery,
     DeviceTestApply,
-    AddrQuery,
-    AddrApply
+    EsdEdit
 };
 
 QT_BEGIN_NAMESPACE
@@ -302,7 +309,7 @@ private:
     QString m_currentSendAddress;
     QMap<QString, QList<QString>> addressFuncData;
     QVector<QStringList> newarrange;
-    DeviceWidget* m_selectedDevice = nullptr;
+    QSet<DeviceWidget*> m_selectedDevices;
     QList<ImageDeviceData> m_imageDeviceList;
     QMap<QString, int> m_devIdCounters;
     QMap<QString, QSet<int>> m_deletedDeviceIds; // 新增：按类型存储已删除的设备ID
@@ -369,14 +376,14 @@ private:
     int btn5DeviceReg; // pushButton_5的寄存器地址
     ToolCommandContext m_toolContext = ToolCommandContext::None;
     SerialWorker* m_activeToolWorker = nullptr;
-    QPushButton* m_btnDevModifyAddr = nullptr;
-    QPushButton* m_btnDevModifyChannel = nullptr;
-    QStackedWidget* m_stackDevModify = nullptr;
-    QLineEdit* m_leDisplayAddress = nullptr;
-    QLineEdit* m_leInputAddress = nullptr;
-    QPushButton* m_btnAddrQuery = nullptr;
-    QPushButton* m_btnAddrApply = nullptr;
-    QTextBrowser* m_tbAddrLog = nullptr;
+    EsdEditPanel* m_esdEditPanel = nullptr;
+    bool m_deviceModifyUnlocked = false;
+    int m_prevStackedPageIndex = 0;
+    static const int kDeviceModifyPageIndex = 2;
+    void onStackedWidgetCurrentChanged(int index);
+    void promptDeviceModifyPassword();
+    QString loadDeviceModifyPassword() const;
+    void setDeviceModifyInteractionEnabled(bool enabled);
     void parsePushButton5Response(const QString& type, int addr, int reg = -1); // 解析pushButton_5响应
     void updateCycleButtonText();
     void addImageToHistory(const QString& imagePath); // 添加图片到历史列表
@@ -389,11 +396,11 @@ private:
     void refreshSerialPortList();
     void setupSharedSerialUi();
     void setupDeviceModifyUi();
-    void updateDeviceModifyModeButtons();
     void applyDeviceModifyPageStyle();
     SerialWorker* getToolSerialWorker() const;
     QByteArray buildModbusHexFrame(const QString& hexPayload) const;
     bool sendToolFrame(const QString& hexPayload, const QString& expectedFunc, ToolCommandContext context);
+    void onEsdEditFrameSend(const QByteArray& frame, const QString& expectedFunc);
     void updateMapPageToolbarsPosition(); // 将地图页工具栏定位到地图下方
     bool m_separateEnvEsd = true;
 
@@ -451,7 +458,11 @@ private:
     void onPushButtonDeleteClicked();
     void onBtnAddDeviceClicked();
     void onBtnAutoGenerateClicked();
-    void onDeviceDoubleClicked(DeviceWidget* device); // 新增：双击设备处理函数
+    void clearDeviceSelection();
+    void wireDeviceSelectionSignals(DeviceWidget* device);
+    void onDeviceClicked(DeviceWidget* device, bool ctrlPressed);
+    void onDeviceDoubleClicked(DeviceWidget* device); // 双击：单选该设备
+    bool deleteSelectedMapDevices(bool showSuccessBox);
     void onImageListCurrentIndexChanged(int index); // 新增：图片列表切换槽函数
     void onBtnDeleteClicked();
     void updateIonizerStatus(const QString& deviceId, bool isOnline); // 新增：更新离子风机状态
@@ -487,8 +498,6 @@ private slots:
     void onRefreshSerialPortsClicked();
     void onToolCommandCompleted(const QByteArray& frame, const QString& expectedFuncCode);
     void onToolCommandFailed(const QString& reason);
-    void onDevModifyAddrQuery();
-    void onDevModifyAddrApply();
 
     // 托盘图标相关槽函数
     void onTrayIconActivated(QSystemTrayIcon::ActivationReason reason);
