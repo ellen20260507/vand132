@@ -1,0 +1,42 @@
+{
+  "mysql_config_path": "../mysql_config.ini",
+  "lookback_hours": 4000,
+  "min_samples": 6,
+  "predict_horizon_hours": 4,
+  "poll_interval_seconds": 300,
+  "service_task_name": "ESD-PredictAlert",
+  "ai": {
+    "enabled": true,
+    "provider": "siliconflow",
+    "api_base": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "secrets_file": "ai_secrets.json",
+    "timeout_seconds": 120,
+    "temperature": 0.2,
+    "duplicate_minutes": 60,
+    "rules_fallback": true
+  },
+  "targets": {
+    "wristband_rate": {
+      "label": "腕带合格率",
+      "column": "w_qualified_rate",
+      "warn_threshold": 85.0,
+      "critical_threshold": 80.0
+    }
+  },
+  "rules": {
+    "humidity_high": 75.0,
+    "humidity_weight": 15,
+    "temp_high": 28.0,
+    "temp_weight": 10,
+    "cleanliness_low": 60.0,
+    "cleanliness_weight": 10,
+    "peer_rate_low": 88.0,
+    "peer_rate_weight": 10,
+    "trend_drop_per_hour": 1.5,
+    "trend_weight": 20,
+    "risk_score_warn": 45,
+    "risk_score_critical": 70
+  }
+}

@@ -8,7 +8,7 @@ if not exist "%ISCC%" set "ISCC=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=C:\Program Files\Inno Setup 6\ISCC.exe"
 
 echo ========================================
-echo ESD-1000-B installer build (vand1 3-2)
+echo ESD-1000 installer build (vand1 3-2)
 echo ========================================
 echo.
 
@@ -38,8 +38,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%installer\writ
 
 echo.
 echo Done
-echo Installer: %PROJECT_DIR%installer\output\ESD-1000-B_Setup.exe
-echo Portable ZIP: %PROJECT_DIR%installer\output\ESD-1000-B_Portable.zip
+echo Installer: %PROJECT_DIR%installer\output\ESD-1000_Setup.exe
+echo Portable ZIP: %PROJECT_DIR%installer\output\ESD-1000_Portable.zip
 echo Checksum: %PROJECT_DIR%installer\output\checksum.txt
 echo.
 echo Tip: send the ZIP to customers if WeChat corrupts the setup.exe

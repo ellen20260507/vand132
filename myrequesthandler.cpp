@@ -4,6 +4,7 @@
 #include "dbmanager.h"
 #include "staticfilecontroller.h"
 #include <QApplication>
+#include <QCoreApplication>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -19,6 +20,307 @@
 #include <QDir>
 
 using namespace stefanfrings;
+
+namespace {
+
+QString loadMesApiKey()
+{
+    const QString iniPath = QCoreApplication::applicationDirPath() + QStringLiteral("/mes_api.ini");
+    QSettings settings(iniPath, QSettings::IniFormat);
+    return settings.value(QStringLiteral("MesApi/apiKey")).toString().trimmed();
+}
+
+bool isJsonAll(const QJsonValue& value)
+{
+    return value.isString() && value.toString().compare(QStringLiteral("ALL"), Qt::CaseInsensitive) == 0;
+}
+
+QDateTime parseIsoDateTime(const QString& text, bool* okOut = nullptr)
+{
+    QDateTime dt = QDateTime::fromString(text, Qt::ISODate);
+    if (!dt.isValid()) {
+        dt = QDateTime::fromString(text, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    }
+    if (!dt.isValid()) {
+        dt = QDateTime::fromString(text, QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"));
+    }
+    if (okOut) {
+        *okOut = dt.isValid();
+    }
+    return dt;
+}
+
+void writeMesJson(HttpResponse& response, const QJsonObject& body, int statusCode = 200)
+{
+    response.setStatus(statusCode, statusCode == 401 ? "Unauthorized" : (statusCode == 400 ? "Bad Request" : "OK"));
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.write(QJsonDocument(body).toJson(QJsonDocument::Compact), true);
+}
+
+bool validateMesApiKey(const HttpRequest& request, QJsonObject& errorObj)
+{
+    const QString configuredKey = loadMesApiKey();
+    if (configuredKey.isEmpty()) {
+        return true;
+    }
+
+    const QString providedKey = QString::fromUtf8(request.getHeader("X-Api-Key")).trimmed();
+    if (providedKey.isEmpty() || providedKey != configuredKey) {
+        errorObj.insert(QStringLiteral("success"), false);
+        errorObj.insert(QStringLiteral("code"), QStringLiteral("INVALID_API_KEY"));
+        errorObj.insert(QStringLiteral("message"), QStringLiteral("API Key 无效或未提供"));
+        return false;
+    }
+    return true;
+}
+
+bool parseIntListOrAll(const QJsonValue& value, bool& allOut, QList<int>& valuesOut,
+                       QString& errorMessage)
+{
+    allOut = false;
+    valuesOut.clear();
+
+    if (value.isUndefined() || value.isNull()) {
+        allOut = true;
+        return true;
+    }
+    if (isJsonAll(value)) {
+        allOut = true;
+        return true;
+    }
+    if (!value.isArray()) {
+        errorMessage = QStringLiteral("字段必须是 ALL 或整数数组");
+        return false;
+    }
+
+    const QJsonArray array = value.toArray();
+    if (array.isEmpty()) {
+        errorMessage = QStringLiteral("数组不能为空");
+        return false;
+    }
+
+    for (const QJsonValue& item : array) {
+        if (!item.isDouble() && !item.isString()) {
+            errorMessage = QStringLiteral("数组中包含无效整数");
+            return false;
+        }
+        bool ok = false;
+        const int intValue = item.toVariant().toInt(&ok);
+        if (!ok) {
+            errorMessage = QStringLiteral("数组中包含无效整数");
+            return false;
+        }
+        valuesOut.append(intValue);
+    }
+    return true;
+}
+
+bool parseTypeListOrAll(const QJsonValue& value, bool& allOut, QStringList& valuesOut,
+                        QString& errorMessage)
+{
+    allOut = false;
+    valuesOut.clear();
+
+    if (value.isUndefined() || value.isNull()) {
+        allOut = true;
+        return true;
+    }
+    if (isJsonAll(value)) {
+        allOut = true;
+        return true;
+    }
+    if (!value.isArray()) {
+        errorMessage = QStringLiteral("types 必须是 ALL 或类型数组");
+        return false;
+    }
+
+    const QJsonArray array = value.toArray();
+    if (array.isEmpty()) {
+        errorMessage = QStringLiteral("types 数组不能为空");
+        return false;
+    }
+
+    static const QStringList allowedTypes = {
+        QStringLiteral("W"), QStringLiteral("T"), QStringLiteral("E"),
+        QStringLiteral("C"), QStringLiteral("I")
+    };
+
+    for (const QJsonValue& item : array) {
+        const QString type = item.toString().trimmed().toUpper();
+        if (!allowedTypes.contains(type)) {
+            errorMessage = QStringLiteral("不支持的类型: ") + type;
+            return false;
+        }
+        if (!valuesOut.contains(type)) {
+            valuesOut.append(type);
+        }
+    }
+    return true;
+}
+
+bool parseMesQueryRequest(const QJsonObject& body, MesReadingQueryFilter& filter,
+                          QString& errorCode, QString& errorMessage)
+{
+    filter = MesReadingQueryFilter();
+
+    const QJsonObject timeRange = body.value(QStringLiteral("timeRange")).toObject();
+    const QString startText = timeRange.value(QStringLiteral("start")).toVariant().toString().trimmed();
+    const QString endText = timeRange.value(QStringLiteral("end")).toVariant().toString().trimmed();
+
+    if (startText.isEmpty() || startText.compare(QStringLiteral("null"), Qt::CaseInsensitive) == 0) {
+        // no start bound
+    } else {
+        bool ok = false;
+        const QDateTime startTime = parseIsoDateTime(startText, &ok);
+        if (!ok) {
+            errorCode = QStringLiteral("INVALID_TIME_RANGE");
+            errorMessage = QStringLiteral("timeRange.start 时间格式无效");
+            return false;
+        }
+        filter.hasStartTime = true;
+        filter.startTime = startTime;
+    }
+
+    if (endText.isEmpty() || endText.compare(QStringLiteral("null"), Qt::CaseInsensitive) == 0) {
+        // no end bound
+    } else {
+        bool ok = false;
+        const QDateTime endTime = parseIsoDateTime(endText, &ok);
+        if (!ok) {
+            errorCode = QStringLiteral("INVALID_TIME_RANGE");
+            errorMessage = QStringLiteral("timeRange.end 时间格式无效");
+            return false;
+        }
+        filter.hasEndTime = true;
+        filter.endTime = endTime;
+    }
+
+    if (filter.hasStartTime && filter.hasEndTime && filter.startTime > filter.endTime) {
+        errorCode = QStringLiteral("INVALID_TIME_RANGE");
+        errorMessage = QStringLiteral("开始时间不能晚于结束时间");
+        return false;
+    }
+
+    const QJsonObject devicesObj = body.value(QStringLiteral("devices")).toObject();
+    if (!parseIntListOrAll(devicesObj.value(QStringLiteral("modbusAddrs")),
+                           filter.allModbusAddrs, filter.modbusAddrs, errorMessage)) {
+        errorCode = QStringLiteral("INVALID_DEVICES");
+        errorMessage = QStringLiteral("devices.modbusAddrs ") + errorMessage;
+        return false;
+    }
+
+    const QJsonObject typesObj = body.value(QStringLiteral("types")).toObject();
+    if (!parseTypeListOrAll(typesObj.value(QStringLiteral("values")),
+                            filter.allTypes, filter.channelTypes, errorMessage)) {
+        errorCode = QStringLiteral("INVALID_TYPES");
+        return false;
+    }
+
+    const QJsonObject channelsObj = body.value(QStringLiteral("channels")).toObject();
+    if (!parseIntListOrAll(channelsObj.value(QStringLiteral("values")),
+                           filter.allChannels, filter.channelNos, errorMessage)) {
+        errorCode = QStringLiteral("INVALID_CHANNELS");
+        errorMessage = QStringLiteral("channels.values ") + errorMessage;
+        return false;
+    }
+
+    filter.page = body.value(QStringLiteral("page")).toInt(1);
+    if (filter.page <= 0) {
+        filter.page = 1;
+    }
+
+    const QJsonValue pageSizeValue = body.value(QStringLiteral("pageSize"));
+    if (pageSizeValue.isUndefined() || pageSizeValue.isNull()) {
+        filter.pageSize = 1000;
+    } else if (isJsonAll(pageSizeValue)) {
+        filter.allPageSize = true;
+    } else if (pageSizeValue.isDouble()) {
+        const int pageSize = pageSizeValue.toInt();
+        if (pageSize <= 0) {
+            errorCode = QStringLiteral("INVALID_PAGINATION");
+            errorMessage = QStringLiteral("pageSize 必须是正整数或 ALL");
+            return false;
+        }
+        filter.pageSize = pageSize;
+    } else if (pageSizeValue.isString()) {
+        bool ok = false;
+        const int pageSize = pageSizeValue.toString().trimmed().toInt(&ok);
+        if (!ok || pageSize <= 0) {
+            errorCode = QStringLiteral("INVALID_PAGINATION");
+            errorMessage = QStringLiteral("pageSize 必须是正整数或 ALL");
+            return false;
+        }
+        filter.pageSize = pageSize;
+    } else {
+        errorCode = QStringLiteral("INVALID_PAGINATION");
+        errorMessage = QStringLiteral("pageSize 必须是正整数或 ALL");
+        return false;
+    }
+    return true;
+}
+
+QJsonValue intListToJson(bool allValues, const QList<int>& values)
+{
+    if (allValues) {
+        return QStringLiteral("ALL");
+    }
+    QJsonArray array;
+    for (int value : values) {
+        array.append(value);
+    }
+    return array;
+}
+
+QJsonValue stringListToJson(bool allValues, const QStringList& values)
+{
+    if (allValues) {
+        return QStringLiteral("ALL");
+    }
+    QJsonArray array;
+    for (const QString& value : values) {
+        array.append(value);
+    }
+    return array;
+}
+
+QJsonObject buildQueryEcho(const MesReadingQueryFilter& filter)
+{
+    QJsonObject echo;
+    QJsonObject timeRange;
+    if (filter.hasStartTime) {
+        timeRange.insert(QStringLiteral("start"), filter.startTime.toString(Qt::ISODate));
+    } else {
+        timeRange.insert(QStringLiteral("start"), QJsonValue::Null);
+    }
+    if (filter.hasEndTime) {
+        timeRange.insert(QStringLiteral("end"), filter.endTime.toString(Qt::ISODate));
+    } else {
+        timeRange.insert(QStringLiteral("end"), QJsonValue::Null);
+    }
+    echo.insert(QStringLiteral("timeRange"), timeRange);
+
+    QJsonObject devices;
+    devices.insert(QStringLiteral("modbusAddrs"), intListToJson(filter.allModbusAddrs, filter.modbusAddrs));
+    echo.insert(QStringLiteral("devices"), devices);
+
+    QJsonObject types;
+    types.insert(QStringLiteral("values"), stringListToJson(filter.allTypes, filter.channelTypes));
+    echo.insert(QStringLiteral("types"), types);
+
+    QJsonObject channels;
+    channels.insert(QStringLiteral("values"), intListToJson(filter.allChannels, filter.channelNos));
+    echo.insert(QStringLiteral("channels"), channels);
+
+    echo.insert(QStringLiteral("page"), filter.page);
+    if (filter.allPageSize) {
+        echo.insert(QStringLiteral("pageSize"), QStringLiteral("ALL"));
+    } else {
+        echo.insert(QStringLiteral("pageSize"), filter.pageSize);
+    }
+    return echo;
+}
+
+} // namespace
 
 // 构造函数删除 TXT 文件路径初始化，不再使用 red.txt/yellow.txt
 MyRequestHandler::MyRequestHandler(QObject* parent)
@@ -62,6 +364,11 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
     // 处理静态文件请求
     if (path.startsWith("/static/") || path.startsWith("/symbol/")) {
         staticFileController->service(request, response);
+        return;
+    }
+
+    if (method == "POST" && path == "/api/mes/readings/query") {
+        handleMesReadingsQuery(request, response);
         return;
     }
 
@@ -165,14 +472,14 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
             response.setStatus(500, "Internal Error");
             response.setHeader("Content-Type", "text/html; charset=utf-8");
             response.write("Failed to load index page", true);
-            return;
-        }
+                            return;
+                        }
         QByteArray htmlData = htmlFile.readAll();
         htmlFile.close();
-        response.setHeader("Content-Type", "text/html; charset=utf-8");
+                    response.setHeader("Content-Type", "text/html; charset=utf-8");
         response.write(htmlData, true);
-        return;
-    }
+                    return;
+                }
     // 2. 背景图接口��GET /showimage → �回Qt中选中的背景图��固定尺寸适配��
     else if (method == "GET" && path == "/showimage") {
         MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
@@ -2803,5 +3110,95 @@ void MyRequestHandler::notifyThemeChange(const QString& theme)
 void MyRequestHandler::notifyDisplayModeChange(bool separateEnvEsd)
 {
     m_separateEnvEsd = separateEnvEsd;
+}
+
+void MyRequestHandler::handleMesReadingsQuery(HttpRequest& request, HttpResponse& response)
+{
+    QJsonObject errorObj;
+    if (!validateMesApiKey(request, errorObj)) {
+        writeMesJson(response, errorObj, 401);
+        return;
+    }
+
+    const QByteArray requestBody = request.getBody();
+    const QJsonDocument doc = QJsonDocument::fromJson(requestBody);
+    if (!doc.isObject()) {
+        errorObj.insert(QStringLiteral("success"), false);
+        errorObj.insert(QStringLiteral("code"), QStringLiteral("INVALID_JSON"));
+        errorObj.insert(QStringLiteral("message"), QStringLiteral("请求体必须是 JSON 对象"));
+        writeMesJson(response, errorObj, 400);
+        return;
+    }
+
+    const QJsonObject body = doc.object();
+    const QString requestId = body.value(QStringLiteral("requestId")).toString();
+
+    MesReadingQueryFilter filter;
+    QString errorCode;
+    QString errorMessage;
+    if (!parseMesQueryRequest(body, filter, errorCode, errorMessage)) {
+        errorObj.insert(QStringLiteral("success"), false);
+        errorObj.insert(QStringLiteral("code"), errorCode);
+        errorObj.insert(QStringLiteral("message"), errorMessage);
+        if (!requestId.isEmpty()) {
+            errorObj.insert(QStringLiteral("requestId"), requestId);
+        }
+        writeMesJson(response, errorObj, 400);
+        return;
+    }
+
+    DBManager* dbManager = DBManager::instance();
+    if (!dbManager) {
+        errorObj.insert(QStringLiteral("success"), false);
+        errorObj.insert(QStringLiteral("code"), QStringLiteral("DB_UNAVAILABLE"));
+        errorObj.insert(QStringLiteral("message"), QStringLiteral("数据库不可用"));
+        if (!requestId.isEmpty()) {
+            errorObj.insert(QStringLiteral("requestId"), requestId);
+        }
+        writeMesJson(response, errorObj, 500);
+        return;
+    }
+
+    const MesReadingQueryResult queryResult = dbManager->queryMesReadings(filter);
+    if (!queryResult.success) {
+        errorObj.insert(QStringLiteral("success"), false);
+        errorObj.insert(QStringLiteral("code"), queryResult.errorCode);
+        errorObj.insert(QStringLiteral("message"), queryResult.errorMessage);
+        if (!requestId.isEmpty()) {
+            errorObj.insert(QStringLiteral("requestId"), requestId);
+        }
+        writeMesJson(response, errorObj, 500);
+        return;
+    }
+
+    QJsonArray items;
+    for (const MesReadingRow& row : queryResult.items) {
+        QJsonObject item;
+        item.insert(QStringLiteral("pointId"), row.pointId);
+        item.insert(QStringLiteral("recordTime"), row.recordTime.toString(Qt::ISODate));
+        if (row.hasValueNum) {
+            item.insert(QStringLiteral("valueNum"), row.valueNum);
+        } else {
+            item.insert(QStringLiteral("valueNum"), QJsonValue::Null);
+        }
+        item.insert(QStringLiteral("statusDesc"), row.statusDesc);
+        items.append(item);
+    }
+
+    QJsonObject responseObj;
+    responseObj.insert(QStringLiteral("success"), true);
+    if (!requestId.isEmpty()) {
+        responseObj.insert(QStringLiteral("requestId"), requestId);
+    }
+    responseObj.insert(QStringLiteral("query"), buildQueryEcho(queryResult.appliedFilter));
+    responseObj.insert(QStringLiteral("total"), queryResult.total);
+    responseObj.insert(QStringLiteral("page"), queryResult.appliedFilter.page);
+    if (queryResult.appliedFilter.allPageSize) {
+        responseObj.insert(QStringLiteral("pageSize"), QStringLiteral("ALL"));
+    } else {
+        responseObj.insert(QStringLiteral("pageSize"), queryResult.appliedFilter.pageSize);
+    }
+    responseObj.insert(QStringLiteral("items"), items);
+    writeMesJson(response, responseObj, 200);
 }
 

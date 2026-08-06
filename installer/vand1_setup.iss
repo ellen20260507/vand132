@@ -1,4 +1,4 @@
-#define MyAppName "静电管理在线监控系统 B版"
+#define MyAppName "静电管理在线监控系统"
 #define MyAppVersion "1.0"
 #define MyAppPublisher "ESD-1000"
 #define MyAppExeName "vand1.exe"
@@ -9,11 +9,11 @@ AppId={{B7E4D1C2-8A5F-4E6B-9D2F-3C6A8B1E4F5D}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\ESD-1000-B
+DefaultDirName={autopf}\ESD-1000
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=output
-OutputBaseFilename=ESD-1000-B_Setup
+OutputBaseFilename=ESD-1000_Setup
 SetupIconFile={#StagingDir}\symbol\3HESD.ico
 UninstallDisplayIcon={app}\symbol\3HESD.ico
 Compression=lzma2/max

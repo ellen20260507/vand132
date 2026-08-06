@@ -15,35 +15,34 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QHeaderView>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QSpacerItem>
 #include <QtWidgets/QTableWidget>
 #include <QtWidgets/QVBoxLayout>
-#include <QtWidgets/QWidget>
 
 QT_BEGIN_NAMESPACE
 
 class Ui_newdialog
 {
 public:
-    QWidget *layoutWidget;
     QVBoxLayout *verticalLayout;
     QTableWidget *tableWidget;
     QHBoxLayout *horizontalLayout;
     QPushButton *addRowBtn;
     QPushButton *deleteRowBtn;
     QPushButton *saveBtn;
+    QSpacerItem *horizontalSpacer;
 
     void setupUi(QDialog *newdialog)
     {
         if (newdialog->objectName().isEmpty())
             newdialog->setObjectName(QString::fromUtf8("newdialog"));
-        newdialog->resize(900, 500);
-        layoutWidget = new QWidget(newdialog);
-        layoutWidget->setObjectName(QString::fromUtf8("layoutWidget"));
-        layoutWidget->setGeometry(QRect(20, 10, 860, 441));
-        verticalLayout = new QVBoxLayout(layoutWidget);
+        newdialog->resize(1100, 540);
+        newdialog->setMinimumSize(QSize(1000, 480));
+        verticalLayout = new QVBoxLayout(newdialog);
+        verticalLayout->setSpacing(14);
         verticalLayout->setObjectName(QString::fromUtf8("verticalLayout"));
-        verticalLayout->setContentsMargins(0, 0, 0, 0);
-        tableWidget = new QTableWidget(layoutWidget);
+        verticalLayout->setContentsMargins(16, 16, 16, 16);
+        tableWidget = new QTableWidget(newdialog);
         if (tableWidget->columnCount() < 6)
             tableWidget->setColumnCount(6);
         QTableWidgetItem *__qtablewidgetitem = new QTableWidgetItem();
@@ -70,20 +69,24 @@ public:
 
         horizontalLayout = new QHBoxLayout();
         horizontalLayout->setObjectName(QString::fromUtf8("horizontalLayout"));
-        addRowBtn = new QPushButton(layoutWidget);
+        addRowBtn = new QPushButton(newdialog);
         addRowBtn->setObjectName(QString::fromUtf8("addRowBtn"));
 
         horizontalLayout->addWidget(addRowBtn);
 
-        deleteRowBtn = new QPushButton(layoutWidget);
+        deleteRowBtn = new QPushButton(newdialog);
         deleteRowBtn->setObjectName(QString::fromUtf8("deleteRowBtn"));
 
         horizontalLayout->addWidget(deleteRowBtn);
 
-        saveBtn = new QPushButton(layoutWidget);
+        saveBtn = new QPushButton(newdialog);
         saveBtn->setObjectName(QString::fromUtf8("saveBtn"));
 
         horizontalLayout->addWidget(saveBtn);
+
+        horizontalSpacer = new QSpacerItem(40, 20, QSizePolicy::Expanding, QSizePolicy::Minimum);
+
+        horizontalLayout->addItem(horizontalSpacer);
 
 
         verticalLayout->addLayout(horizontalLayout);
@@ -96,7 +99,7 @@ public:
 
     void retranslateUi(QDialog *newdialog)
     {
-        newdialog->setWindowTitle(QCoreApplication::translate("newdialog", "Dialog", nullptr));
+        newdialog->setWindowTitle(QCoreApplication::translate("newdialog", "\350\275\256\350\257\242\350\256\276\347\275\256", nullptr));
         QTableWidgetItem *___qtablewidgetitem = tableWidget->horizontalHeaderItem(0);
         ___qtablewidgetitem->setText(QCoreApplication::translate("newdialog", "\345\234\260\345\235\200", nullptr));
         QTableWidgetItem *___qtablewidgetitem1 = tableWidget->horizontalHeaderItem(1);

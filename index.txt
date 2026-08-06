@@ -1,0 +1,699 @@
+#include "myrequesthandler.h"
+#include "mainwindow.h"
+#include <QApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QFileInfo>
+#include <QTextStream>
+#include <QStringList>
+#include <QDebug>
+
+// 构造函数：初始化exe同目录路径（核心修改）
+MyRequestHandler::MyRequestHandler(QObject* parent)
+    : stefanfrings::HttpRequestHandler(parent)
+{
+    // 获取exe所在目录
+    QString appDir = QCoreApplication::applicationDirPath();
+    // 拼接exe同目录下的文件路径
+    yellowTxtPath = appDir + "/yellow.txt";
+    redTxtPath = appDir + "/red.txt";
+    backgroundImagePath = appDir + "/background.jpg"; // 背景图同目录
+
+    // 打印路径日志，方便调试
+    qDebug() << "MyRequestHandler初始化完成，文件路径：";
+    qDebug() << "yellow.txt：" << yellowTxtPath;
+    qDebug() << "red.txt：" << redTxtPath;
+    qDebug() << "背景图：" << backgroundImagePath;
+    qDebug() << "黄点数据从 TXT 文件读取";
+}
+
+// 处理HTTP请求（核心：替换所有硬编码路径）
+void MyRequestHandler::service(stefanfrings::HttpRequest& request, stefanfrings::HttpResponse& response)
+{
+    QString path = request.getPath();
+    QString method = request.getMethod();
+
+    // 1. 首页HTML（无路径修改，保留原有逻辑）
+    if (method == "GET" && path == "/") {
+        QString html = R"html(
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>静电管理在线监控系统 ESD-1000.V2.0</title>
+        <style>
+            :root {
+                --primary-color: #165DFF;
+                --secondary-color: #0E2F56;
+                --accent-color: #36CFC9;
+                --text-primary: #333333;
+                --text-secondary: #666666;
+                --text-light: #FFFFFF;
+                --bg-primary: #F5F7FA;
+                --bg-secondary: #FFFFFF;
+                --border-color: #E5E6EB;
+                --shadow-light: 0 2px 8px rgba(0, 0, 0, 0.08);
+                --shadow-medium: 0 4px 16px rgba(0, 0, 0, 0.12);
+                --transition-default: all 0.3s ease;
+                --yellow-point: #FFC107;
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { height: 100vh; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; overflow: hidden; background-color: var(--bg-primary); color: var(--text-primary); }
+            .top-bar { height: 60px; background: linear-gradient(90deg, var(--secondary-color), var(--primary-color)); color: var(--text-light); display: flex; align-items: center; justify-content: space-between; padding: 0 30px; box-shadow: var(--shadow-light); position: relative; z-index: 10; }
+            .title { font-size: 22px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+            .title::before { content: ''; width: 4px; height: 24px; background-color: var(--accent-color); border-radius: 2px; }
+            .time-display { font-size: 18px; padding: 6px 12px; background-color: rgba(255, 255, 255, 0.1); border-radius: 4px; backdrop-filter: blur(4px); }
+            .content { display: flex; height: calc(100vh - 60px); padding: 10px; gap: 10px; }
+
+            .map-container::before { content: '设备布局图'; position: absolute; top: 15px; left: 15px; color: var(--text-light); background-color: rgba(22, 93, 255, 0.7); padding: 4px 12px; border-radius: 4px; font-size: 14px; z-index: 5; }
+            .map-container {
+                flex: 5;
+                background-color: var(--bg-secondary);
+                border-radius: 8px;
+                box-shadow: var(--shadow-medium);
+                overflow: hidden;
+                position: relative;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .map-container img {
+                max-width: 100%;
+                max-height: 100%;
+                width: auto;
+                height: auto;
+                object-fit: contain;
+                display: block;
+            }
+            .map-loading { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background-color: rgba(255, 255, 255, 0.8); z-index: 4; opacity: 0; pointer-events: none; transition: var(--transition-default); }
+            .map-loading.active { opacity: 1; pointer-events: all; }
+            .map-loading::after { content: ''; width: 30px; height: 30px; border: 3px solid var(--primary-color); border-top-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+            .map-points { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 6; }
+.map-point {
+    position: absolute;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%; /* 圆形核心属性 */
+    transform: translate(-50%, -50%);
+    transition: all 0.3s ease;
+    cursor: pointer;
+    pointer-events: auto;
+    box-shadow: 0 0 10px; /* 阴影颜色后续由颜色类叠加 */
+}
+.map-redpoint {
+    position: absolute;
+    width: 15px;
+    height: 15px;
+    /* 无border-radius = 正方形 */
+    transform: translate(-50%, -50%);
+    transition: all 0.3s ease;
+    cursor: pointer;
+    pointer-events: auto;
+    box-shadow: 0 0 10px; /* 阴影颜色后续由颜色类叠加 */
+}
+.map-redpoint:hover {
+    width: 18px; /* hover后大小和黄点相同 */
+    height: 18px;
+    box-shadow: 0 0 12px; /* 和黄点同hover阴影 */
+}
+            .map-point:hover { width: 18px; height: 18px; box-shadow: 0 0 12px; }
+.point-color-green {
+    background-color: rgba(72, 187, 120, 1); /* 绿色背景 */
+    box-shadow-color: rgba(72, 187, 120, 0.9); /* 绿色阴影 */
+}
+.point-color-green:hover {
+    box-shadow-color: rgba(72, 187, 120, 1); /* hover增强绿色阴影 */
+}
+
+/* 状态2：黄色（默认色） */
+.point-color-yellow {
+    background-color: rgba(255, 193, 7, 1); /* 黄色背景 */
+    box-shadow-color: rgba(255, 193, 7, 0.9); /* 黄色阴影 */
+}
+.point-color-yellow:hover {
+    box-shadow-color: rgba(255, 193, 7, 1); /* hover增强黄色阴影 */
+}
+
+/* 状态3：红色 */
+.point-color-red {
+    background-color: rgba(153, 153, 153, 1); /* 红色背景 */
+    box-shadow-color: rgba(153, 153, 153, 0.9); /* 红色阴影 */
+}
+.point-color-red:hover {
+    box-shadow-color: rgba(102, 102, 102, 1); /* hover增强红色阴影 */
+}
+            #pointModal {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0, 0, 0, 0.5); /* 半透明背景 */
+                z-index: 100; /* 层级高于所有元素 */
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                opacity: 0; /* 初始隐藏 */
+                pointer-events: none; /* 初始不响应点击 */
+                transition: opacity 0.3s ease;
+            }
+            #pointModal.active { /* 弹窗显示状态 */
+                opacity: 1;
+                pointer-events: all;
+            }
+            #pointModal .modal-content {
+                background-color: var(--bg-secondary);
+                border-radius: 8px;
+                padding: 24px;
+                width: 90%;
+                max-width: 400px;
+                box-shadow: var(--shadow-medium);
+            }
+            #pointModal .modal-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 16px;
+                padding-bottom: 8px;
+                border-bottom: 1px solid var(--border-color);
+            }
+            #pointModal .modal-title {
+                font-size: 18px;
+                color: var(--primary-color);
+                font-weight: 600;
+                margin: 0;
+            }
+            #pointModal .close-btn {
+                background: none;
+                border: none;
+                font-size: 20px;
+                color: var(--text-secondary);
+                cursor: pointer;
+                padding: 4px 8px;
+                border-radius: 4px;
+                transition: background-color 0.2s ease;
+            }
+            #pointModal .close-btn:hover {
+                background-color: var(--bg-primary);
+                color: #f53f3f;
+            }
+            #pointModal .modal-body {
+                font-size: 15px;
+                line-height: 1.6;
+            }
+            #pointModal .modal-body p {
+                margin: 8px 0;
+                color: var(--text-primary);
+            }
+            #pointModal .modal-body strong {
+                color: var(--secondary-color);
+            }
+
+            .data-panel { flex: 1; background-color: var(--bg-secondary); border-radius: 8px; box-shadow: var(--shadow-light); padding: 20px; overflow-y: auto; transition: var(--transition-default); }
+            .data-panel:hover { box-shadow: var(--shadow-medium); }
+            .data-panel h2 { color: var(--primary-color); margin-bottom: 20px; padding-bottom: 12px; border-bottom: 2px solid var(--accent-color); font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+            .data-panel h2::before { content: ''; width: 8px; height: 8px; background-color: var(--accent-color); border-radius: 50%; }
+            .data-container { display: flex; flex-direction: column; gap: 12px; }
+            .data-item { padding: 15px; background-color: var(--bg-secondary); border-radius: 6px; box-shadow: var(--shadow-light); border-left: 3px solid var(--primary-color); transition: var(--transition-default); transform-origin: left center; animation: fadeIn 0.5s ease forwards; opacity: 0; }
+            .data-item:hover { transform: translateX(5px); box-shadow: var(--shadow-medium); }
+            .data-item strong { color: var(--secondary-color); font-size: 15px; display: block; margin-bottom: 8px; }
+            .data-item div { color: var(--text-secondary); font-size: 14px; line-height: 1.5; }
+            .no-data { text-align: center; padding: 30px 10px; color: var(--text-secondary); font-size: 14px; background-color: rgba(0, 0, 0, 0.02); border-radius: 6px; }
+            .data-panel::-webkit-scrollbar { width: 6px; }
+            .data-panel::-webkit-scrollbar-track { background: var(--bg-primary); border-radius: 3px; }
+            .data-panel::-webkit-scrollbar-thumb { background: #CCD1D9; border-radius: 3px; }
+            .data-panel::-webkit-scrollbar-thumb:hover { background: #AAB2BD; }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+            @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            @media (max-width: 1024px) { .content { flex-direction: column; } .map-container, .data-panel { flex: none; height: 50%; } .top-bar { padding: 0 15px; } .title { font-size: 20px; } }
+        </style>
+    </head>
+    <body>
+        <div class="top-bar">
+            <div class="title">经典管理在线监控系统 ESD-1000.V.2.0</div>
+            <div class="time-display" id="timeDisplay"></div>
+        </div>
+        <div class="content">
+            <div class="map-container">
+                <div class="map-loading active" id="mapLoading"></div>
+                <img src="/showimage" alt="设备布局图" onload="document.getElementById('mapLoading').classList.remove('active')">
+                <div class="map-points" id="mapPoints"></div>
+                <div class="map-redpoints" id="mapRedPoints"></div>
+            </div>
+            <div class="data-panel">
+                <h2>设备数据</h2>
+                <div class="data-container" id="dataContainer">加载中...</div>
+            </div>
+        </div>
+
+        <!-- 新增：黄点弹窗 -->
+        <div id="pointModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 class="modal-title" id="modalAddress">设备地址</h3>
+                    <button class="close-btn" id="modalClose">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p><strong>设备标识：</strong><span id="modalPointId">-</span></p>
+                    <p><strong>相对坐标：</strong><span id="modalCoord">-</span></p>
+                    <p><strong>设备状态：</strong><span id="modalStatus">-</span></p>
+                </div>
+            </div>
+        </div>
+
+        <script>
+                // 1. 系统时间更新（不变）
+                function updateSystemTime() {
+                    const now = new Date();
+                    const timeStr = now.toLocaleString("zh-CN", {
+                        year: "numeric", month: "2-digit", day: "2-digit",
+                        hour: "2-digit", minute: "2-digit", second: "2-digit"
+                    });
+                    document.getElementById("timeDisplay").textContent = timeStr;
+                }
+                updateSystemTime();
+                setInterval(updateSystemTime, 1000);
+
+                // 2. 核心：缓存 TXT 中的「设备标识→状态」映射（W1→1，T2→2 等）
+                let deviceStatusMap = {}; // key: 设备标识（W1/T2），value: 状态（1/2/3）
+                function fetchDeviceStatus() {
+                    fetch('/detectedpoints').then(res => res.json()).then(points => {
+                        points.forEach(p => {
+                            deviceStatusMap[p.address] = p.status;
+                        });
+                        console.log("黄点状态缓存：", deviceStatusMap); // 新增打印
+                    });
+                    fetch('/detectedred').then(res => res.json()).then(points => {
+                        points.forEach(p => {
+                            deviceStatusMap[p.address] = p.status;
+                        });
+                        console.log("红点状态缓存：", deviceStatusMap); // 新增打印
+                    });
+                }
+                // 初始化缓存
+                fetchDeviceStatus();
+                setInterval(fetchDeviceStatus, 3000); // 和TXT刷新频率一致
+
+                // 3. 串口数据渲染（核心修改：关联设备标识+状态+十进制转换）
+                let lastSerialData = {};
+                function getDeviceIdFromSerialKey(serialKey) {
+                    if (serialKey.length !== 8) return "未知设备"; // 串口key格式：4位地址+4位功能码
+                    const addrHex = serialKey.slice(0, 4); // 前4位：地址（十六进制）
+                    const funcCode = serialKey.slice(4, 8); // 后4位：功能码
+                    // 功能码→设备前缀（W/T/E）
+                    let prefix = "?";
+                    if (funcCode === "1011") prefix = "W";   // 腕带→W
+                    else if (funcCode === "1014") prefix = "T"; // 台垫→T
+                    else if (funcCode === "1021") prefix = "E"; // 设备→E
+                    // 十六进制地址→十进制（如"0001"→1）
+                    const addrDec = parseInt(addrHex, 16);
+                    return `${prefix}${addrDec}`; // 最终设备标识：W1/T2/E3
+                }
+                // 辅助函数：十六进制数组→十进制数组
+                function hexToDecArray(hexArray) {
+                    return hexArray.map(hex => {
+                        const dec = parseInt(hex, 16);
+                        return isNaN(dec) ? "无效" : dec.toString();
+                    });
+                }
+                // 辅助函数：状态码→文字+颜色（1=正常绿，2=警告黄，3=异常红）
+                function getStatusTextAndColor(statusCode) {
+                    switch(statusCode) {
+                        case 1: return { text: "正常", color: "#48bb78" };
+                        case 2: return { text: "请检查连接或佩戴状况", color: "#ffc107" };
+                        case 3: return { text: "异常", color: "#999999" };
+                        default: return { text: "未知", color: "#666" };
+                    }
+                }
+                                        function fetchSerialData() {
+                                            // 1. 获取数据容器（确保始终能访问，避免报错）
+                                            const container = document.getElementById("dataContainer");
+                                            if (!container) {
+                                                console.error("未找到数据容器元素，无法渲染串口数据");
+                                                return;
+                                            }
+
+                                            // 2. 发起请求获取串口数据
+                                            fetch('/getdata')
+                                                .then(response => {
+                                                    // 检查HTTP响应状态（非200均视为失败）
+                                                    if (!response.ok) {
+                                                        throw new Error(`服务器返回异常：${response.status}（${response.statusText}）`);
+                                                    }
+                                                    return response.json(); // 解析JSON数据
+                                                })
+                                                .then(serialData => {
+                                                    // 3. 调试日志：打印原始串口数据（方便排查后端是否返回有效数据）
+                                                    console.log("【串口数据】原始数据：", serialData);
+
+                                                    // 4. 对比上一次数据，避免重复渲染（减少无效刷新）
+                                                    const currentDataStr = JSON.stringify(serialData);
+                                                    if (currentDataStr === JSON.stringify(lastSerialData)) {
+                                                        console.log("【串口数据】与上一次相同，跳过渲染");
+                                                        return;
+                                                    }
+                                                    lastSerialData = serialData; // 更新缓存
+
+                                                    // 5. 处理空数据（后端无有效数据时）
+                                                    if (Object.keys(serialData).length === 0) {
+                                                        container.innerHTML = '<div class="no-data">暂无串口数据（设备未响应或未配置）</div>';
+                                                        return;
+                                                    }
+
+                                                    // 6. 渲染有效数据（核心逻辑）
+                                                    let html = "";
+                                                    let renderIndex = 0; // 用于动画延迟，避免同时渲染卡顿
+
+                                                    // 遍历所有串口数据（key：地址+功能码，value：十六进制数据数组）
+                                                    for (const [serialKey, hexArray] of Object.entries(serialData)) {
+                                                        // 6.1 解析设备标识（如从"00011011"得到"W1"）
+                                                        const deviceId = getDeviceIdFromSerialKey(serialKey);
+                                                        console.log(`【串口数据】解析标识：serialKey=${serialKey} → deviceId=${deviceId}`);
+
+                                                        // 6.2 获取设备状态（从TXT缓存中匹配，无匹配则显示“待同步”）
+                                                        const statusCode = deviceStatusMap[deviceId];
+                                                        let statusInfo;
+                                                        if (statusCode === undefined) {
+                                                            // 未匹配到状态（标识不一致或TXT未加载）
+                                                            statusInfo = { text: "待同步", color: "#666" };
+                                                            console.warn(`【状态匹配】未找到标识${deviceId}的状态（检查TXT文件和串口解析是否一致）`);
+                                                        } else {
+                                                            // 匹配到状态，转换为文字和颜色
+                                                            statusInfo = getStatusTextAndColor(statusCode);
+                                                        }
+
+                                                        // 6.3 转换十六进制数据为十进制（处理空/无效数据）
+                                                        const decArray = hexToDecArray(hexArray);
+                                                        // 判断是否全为无效数据（避免显示0）
+                                                        const hasValidData = decArray.some(item => item !== "无效" && item !== "无数据");
+                                                        const displayData = hasValidData ? decArray.join(" , ") : "无有效数据";
+
+                                                        // 6.4 生成HTML（带动画延迟，提升视觉体验）
+                                                        html += `<div class="data-item" style="animation-delay: ${renderIndex * 0.05}s">
+                                                            <div><strong>设备标识：</strong>${deviceId}</div>
+                                                            <div><strong>状态：</strong><span style="color: ${statusInfo.color}">${statusInfo.text}</span></div>
+                                                            <div><strong>数据：</strong>${displayData}</div>
+                                                        </div>`;
+
+                                                        renderIndex++;
+                                                    }
+
+                                                    // 7. 渲染到页面
+                                                    container.innerHTML = html;
+                                                })
+                                                .catch((error) => {
+                                                    // 8. 错误处理（网络失败、JSON解析错误等）
+                                                    console.error("【串口数据获取失败】详细原因：", error);
+                                                    container.innerHTML = `<div class="no-data" style="color: #f53f3f;">
+                                                        数据获取失败：${error.message}<br>
+                                                        请检查后端服务或网络连接
+                                                    </div>`;
+                                                });
+                                        }
+                // 初始化渲染+定时刷新
+                fetchSerialData();
+                setInterval(fetchSerialData, 3000);
+
+                // 4. 黄点/红点渲染+弹窗逻辑（不变，保留原有）
+                let imgRenderInfo = { width: 0, height: 0 };
+                const modal = document.getElementById('pointModal');
+                const modalClose = document.getElementById('modalClose');
+                const modalAddress = document.getElementById('modalAddress');
+                const modalPointId = document.getElementById('modalPointId');
+                const modalCoord = document.getElementById('modalCoord');
+                const modalStatus = document.getElementById('modalStatus');
+
+                document.querySelector('.map-container img').onload = function() {
+                    imgRenderInfo.width = this.offsetWidth;
+                    imgRenderInfo.height = this.offsetHeight;
+                    document.getElementById('mapLoading').classList.remove('active');
+                    fetchDetectedYellowPoints();
+                    fetchDetectedRedPoints();
+                };
+
+                modalClose.addEventListener('click', () => modal.classList.remove('active'));
+                modal.addEventListener('click', (e) => e.target === modal && modal.classList.remove('active'));
+
+                function fetchDetectedYellowPoints() {
+                    fetch('/detectedpoints').then(res => res.json()).then(points => {
+                        const container = document.getElementById("mapPoints");
+                        container.innerHTML = "";
+                        if (!points.length || !imgRenderInfo.width) return;
+                        points.forEach(point => {
+                            const el = document.createElement("div");
+                            el.classList.add("map-point");
+                            if (point.status === 1) el.classList.add("point-color-green");
+                            else if (point.status === 2) el.classList.add("point-color-yellow");
+                            else if (point.status === 3) el.classList.add("point-color-red");
+                            const x = (point.x / 100) * imgRenderInfo.width;
+                            const y = (point.y / 100) * imgRenderInfo.height;
+                            el.style.left = `${x}px`;
+                            el.style.top = `${y}px`;
+                            el.addEventListener('click', () => {
+                                modalAddress.textContent = "设备信息";
+                                modalPointId.textContent = point.address;
+                                modalCoord.textContent = `${point.x.toFixed(1)}%, ${point.y.toFixed(1)}%`;
+                                const statusText = point.status === 1 ? "正常（绿色）" : point.status === 2 ? "警告（黄色）" : "未检测（灰色）";
+                                modalStatus.textContent = statusText;
+                                modal.classList.add('active');
+                            });
+                            container.appendChild(el);
+                        });
+                    });
+                }
+
+                function fetchDetectedRedPoints() {
+                    fetch('/detectedred').then(res => res.json()).then(points => {
+                        const container = document.getElementById("mapRedPoints");
+                        container.innerHTML = "";
+                        if (!points.length || !imgRenderInfo.width) return;
+                        points.forEach(point => {
+                            const el = document.createElement("div");
+                            el.classList.add("map-redpoint");
+                            if (point.status === 1) el.classList.add("point-color-green");
+                            else if (point.status === 2) el.classList.add("point-color-yellow");
+                            else if (point.status === 3) el.classList.add("point-color-red");
+                            const x = (point.x / 100) * imgRenderInfo.width;
+                            const y = (point.y / 100) * imgRenderInfo.height;
+                            el.style.left = `${x}px`;
+                            el.style.top = `${y}px`;
+                            el.addEventListener('click', () => {
+                                modalAddress.textContent = "设备信息";
+                                modalPointId.textContent = point.address;
+                                modalCoord.textContent = `${point.x.toFixed(1)}%, ${point.y.toFixed(1)}%`;
+                                const statusText = point.status === 1 ? "正常（绿色）" : point.status === 2 ? "警告（黄色）" : "异常（红色）";
+                                modalStatus.textContent = statusText;
+                                modal.classList.add('active');
+                            });
+                            container.appendChild(el);
+                        });
+                    });
+                }
+
+                fetchDetectedYellowPoints();
+                fetchDetectedRedPoints();
+                setInterval(fetchDetectedYellowPoints, 2000);
+                setInterval(fetchDetectedRedPoints, 2000);
+        </script>
+    </body>
+    </html>
+            )html";
+            response.setHeader("Content-Type", "text/html; charset=utf-8");
+            response.write(html.toUtf8(), true);
+            return;
+        }
+
+    // 2. 背景图接口：/showimage（替换为exe同目录路径）
+    else if (method == "GET" && path == "/showimage") {
+        QFile imageFile(backgroundImagePath); // 用初始化的同目录路径
+
+        // 检查文件是否存在
+        if (!imageFile.exists()) {
+            qDebug() << "背景图不存在：" << backgroundImagePath;
+            response.setStatus(404, "Image Not Found");
+            response.write(QString("背景图不存在（路径：%1）").arg(backgroundImagePath).toUtf8(), true);
+            return;
+        }
+
+        // 检查文件是否能打开
+        if (!imageFile.open(QIODevice::ReadOnly)) {
+            qDebug() << "打开背景图失败：" << imageFile.errorString();
+            response.setStatus(500, "Internal Error");
+            response.write(QString("打开背景图失败（原因：%1）").arg(imageFile.errorString()).toUtf8(), true);
+            return;
+        }
+
+        // 读取图片数据并返回
+        QByteArray imageData = imageFile.readAll();
+        imageFile.close();
+        response.setHeader("Content-Type", "image/jpeg");
+        response.setHeader("Content-Length", QString::number(imageData.size()).toUtf8());
+        response.write(imageData, true);
+        return;
+    }
+
+    // 3. 黄点数据接口：/detectedpoints（替换为exe同目录路径）
+    else if (method == "GET" && path == "/detectedpoints") {
+        QFile txtFile(yellowTxtPath); // 用初始化的同目录路径
+
+        if (!txtFile.exists()) {
+            qDebug() << "设备TXT文件不存在：" << yellowTxtPath;
+            response.setStatus(404, "File Not Found");
+            response.write("设备检测数据文件不存在", true);
+            return;
+        }
+
+        if (!txtFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qDebug() << "打开设备TXT文件失败：" << txtFile.errorString();
+            response.setStatus(500, "File Open Failed");
+            response.write(QString("打开设备数据文件失败（原因：%1）").arg(txtFile.errorString()).toUtf8(), true);
+            return;
+        }
+
+        QJsonArray pointArray;
+        QTextStream in(&txtFile);
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            if (line.isEmpty()) continue;
+
+            // 解析“x,y|地址|状态”格式
+            QStringList lineParts = line.split('|');
+            if (lineParts.size() != 3) {
+                qDebug() << "无效黄点格式（跳过）：" << line;
+                continue;
+            }
+
+            // 解析坐标（x,y）
+            QStringList coordParts = lineParts[0].split(',');
+            if (coordParts.size() != 2) {
+                qDebug() << "无效坐标格式（跳过）：" << lineParts[0];
+                continue;
+            }
+
+            // 转换坐标为浮点数
+            bool xOk = false, yOk = false;
+            float x = coordParts[0].toFloat(&xOk);
+            float y = coordParts[1].toFloat(&yOk);
+            if (xOk && yOk) {
+                bool statusOk = false;
+                int status = lineParts[2].toInt(&statusOk);
+                if (!statusOk || (status != 1 && status != 2 && status != 3)) {
+                    qDebug() << "黄点状态值无效（默认2=黄）：" << lineParts[2];
+                    status = 2;
+                }
+                QJsonObject pointObj;
+                pointObj["x"] = x;
+                pointObj["y"] = y;
+                pointObj["address"] = lineParts[1]; // 设备标识（W1/T2/E3）
+                pointObj["status"] = status;
+                pointArray.append(pointObj);
+            } else {
+                qDebug() << "坐标转换失败（跳过）：" << line;
+            }
+        }
+        txtFile.close();
+
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.write(QJsonDocument(pointArray).toJson(QJsonDocument::Compact), true);
+        return;
+    }
+
+    // 4. 串口数据接口：/getdata（无路径修改，保留原有逻辑）
+    else if (method == "GET" && path == "/getdata") {
+        MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
+        if (!mainWindow) {
+            qDebug() << "获取MainWindow实例失败（无法读取串口数据）";
+            response.setStatus(500, "Internal Error");
+            response.write("无法获取串口数据（MainWindow实例异常）", true);
+            return;
+        }
+
+        QMap<QString, QList<QString>> serialData = mainWindow->getAddressFuncData();
+        QJsonObject dataObj;
+
+        for (auto it = serialData.begin(); it != serialData.end(); ++it) {
+            QJsonArray dataArray;
+            for (const QString& dataItem : it.value()) {
+                dataArray.append(dataItem);
+            }
+            dataObj[it.key()] = dataArray;
+        }
+
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.write(QJsonDocument(dataObj).toJson(QJsonDocument::Compact), true);
+        return;
+    }
+
+    // 5. 红点数据接口：/detectedred（替换为exe同目录路径）
+    else if (method == "GET" && path == "/detectedred") {
+        QFile txtFile(redTxtPath); // 用初始化的同目录路径
+
+        if (!txtFile.exists()) {
+            qDebug() << "红点TXT文件不存在：" << redTxtPath;
+            response.setStatus(404, "File Not Found");
+            response.write("红点检测数据文件不存在", true);
+            return;
+        }
+
+        if (!txtFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qDebug() << "打开红点TXT文件失败：" << txtFile.errorString();
+            response.setStatus(500, "File Open Failed");
+            response.write(QString("打开红点数据文件失败（原因：%1）").arg(txtFile.errorString()).toUtf8(), true);
+            return;
+        }
+
+        QJsonArray pointArray;
+        QTextStream in(&txtFile);
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            if (line.isEmpty()) continue;
+
+            // 解析“x,y|地址|状态”格式
+            QStringList lineParts = line.split('|');
+            if (lineParts.size() != 3) {
+                qDebug() << "无效红点格式（跳过）：" << line;
+                continue;
+            }
+
+            QStringList coordParts = lineParts[0].split(',');
+            if (coordParts.size() != 2) {
+                qDebug() << "无效红点坐标格式（跳过）：" << lineParts[0];
+                continue;
+            }
+
+            bool xOk = false, yOk = false;
+            float x = coordParts[0].toFloat(&xOk);
+            float y = coordParts[1].toFloat(&yOk);
+            if (xOk && yOk) {
+                bool statusOk = false;
+                int status = lineParts[2].toInt(&statusOk);
+                if (!statusOk || (status != 1 && status != 2 && status != 3)) {
+                    qDebug() << "红点状态值无效（默认2=黄）：" << lineParts[2];
+                    status = 2;
+                }
+                QJsonObject pointObj;
+                pointObj["x"] = x;
+                pointObj["y"] = y;
+                pointObj["address"] = lineParts[1]; // 设备标识（E1/E2）
+                pointObj["status"] = status;
+                pointArray.append(pointObj);
+            } else {
+                qDebug() << "红点坐标转换失败（跳过）：" << line;
+            }
+        }
+        txtFile.close();
+
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.write(QJsonDocument(pointArray).toJson(QJsonDocument::Compact), true);
+        return;
+    }
+
+    // 6. 其他路径：返回404
+    else {
+        response.setStatus(404, "Not Found");
+        response.write(QString("请求路径不存在：%1").arg(path).toUtf8(), true);
+    }
+}

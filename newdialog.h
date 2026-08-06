@@ -10,6 +10,10 @@
 #include <QTextStream>
 #include <QApplication>
 #include <QPushButton>
+#include <QFontMetrics>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QShowEvent>
 
 namespace Ui {
 class newdialog;
@@ -24,9 +28,13 @@ public:
     ~newdialog();
     QVector<QStringList> getTableData();
 
+protected:
+    void showEvent(QShowEvent* event) override;
+
 private:
     Ui::newdialog *ui;
     static const int kDataColumnCount = 6;
+    static const int kDownloadColumnMinWidth = 112;
 
     QString getFilePath() const {
         return qApp->applicationDirPath() + "/poll_config.txt";
@@ -37,6 +45,7 @@ private:
     void loadConfigFromFile();
     void setupDownloadButton(int row);
     void refreshAllDownloadButtons();
+    void updateDownloadColumnWidth();
 
 private slots:
     void addRowBtn_clicked();

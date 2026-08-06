@@ -7,6 +7,7 @@
 #include "httplistener.h"
 #include "myrequesthandler.h"
 #include "mainwindow.h"
+#include "uistyle.h"
 
 int main(int argc, char *argv[])
 {
@@ -17,7 +18,7 @@ int main(int argc, char *argv[])
         app.setApplicationDisplayName(appDisplayName);
         // 设置应用程序图标
         app.setWindowIcon(QIcon(":/symbol/3HESD.png"));
-        
+        installMessageBoxTuner();
         // 设置插件路径，确保Qt能够找到SQL驱动
         QString appDir = QCoreApplication::applicationDirPath();
         QString pluginPath = appDir + "/plugins";

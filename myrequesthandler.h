@@ -78,6 +78,8 @@ private:
         int m_interval;
     };
     
+    void handleMesReadingsQuery(HttpRequest& request, HttpResponse& response);
+
     QMutex m_mutex;
 };
 

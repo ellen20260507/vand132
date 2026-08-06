@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 
 $StagingDir = Join-Path $PSScriptRoot 'staging'
 $OutputDir = Join-Path $PSScriptRoot 'output'
-$ZipPath = Join-Path $OutputDir 'ESD-1000-B_Portable.zip'
+$ZipPath = Join-Path $OutputDir 'ESD-1000_Portable.zip'
 
 & (Join-Path $PSScriptRoot 'prepare_staging.ps1')
 
