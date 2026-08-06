@@ -180,13 +180,28 @@ MainWindow::MainWindow(QWidget *parent)
     // ===== 检查必要的环境文件 =====
     ui->textBrowser->append("[数据库] 检查必要的环境文件:");
 
-    // 1. 检查 libmysql.dll
+    // 1. 检查 libmysql.dll 及其 OpenSSL 依赖（MySQL 8 客户端必需）
     QString libmysqlPath = appDir + "/libmysql.dll";
     QFileInfo libmysqlFile(libmysqlPath);
     if (libmysqlFile.exists()) {
         ui->textBrowser->append("[数据库]   ✓ libmysql.dll 存在");
     } else {
         ui->textBrowser->append("[数据库]   ✗ libmysql.dll 缺失！");
+    }
+
+    QString libsslPath = appDir + "/libssl-3-x64.dll";
+    QString libcryptoPath = appDir + "/libcrypto-3-x64.dll";
+    QFileInfo libsslFile(libsslPath);
+    QFileInfo libcryptoFile(libcryptoPath);
+    if (libsslFile.exists()) {
+        ui->textBrowser->append("[数据库]   ✓ libssl-3-x64.dll 存在");
+    } else {
+        ui->textBrowser->append("[数据库]   ✗ libssl-3-x64.dll 缺失！（libmysql 依赖，常见导致 Driver not loaded）");
+    }
+    if (libcryptoFile.exists()) {
+        ui->textBrowser->append("[数据库]   ✓ libcrypto-3-x64.dll 存在");
+    } else {
+        ui->textBrowser->append("[数据库]   ✗ libcrypto-3-x64.dll 缺失！（libmysql 依赖，常见导致 Driver not loaded）");
     }
 
     // 2. 检查 Qt5Sql.dll
@@ -218,7 +233,8 @@ MainWindow::MainWindow(QWidget *parent)
     }
 
     // 检查是否有缺失的文件
-    bool allFilesPresent = libmysqlFile.exists() && qt5SqlFile.exists() && mysqlDriverFile.exists() && configFile.exists();
+    bool allFilesPresent = libmysqlFile.exists() && libsslFile.exists() && libcryptoFile.exists()
+            && qt5SqlFile.exists() && mysqlDriverFile.exists() && configFile.exists();
     if (allFilesPresent) {
         ui->textBrowser->append("[数据库] ✓ 所有必要文件检查通过");
     } else {
@@ -261,8 +277,8 @@ MainWindow::MainWindow(QWidget *parent)
     if (!drivers.contains("QMYSQL")) {
         ui->textBrowser->append("[数据库]   ✗ QMYSQL 驱动不可用！");
         ui->textBrowser->append("[数据库]     - 可能原因: qsqlmysql.dll 与 Qt 版本不匹配");
-        ui->textBrowser->append("[数据库]     - 可能原因: libmysql.dll 版本不兼容");
-        ui->textBrowser->append("[数据库]     - 解决方法: 从 MySQL 安装目录复制 libmysql.dll");
+        ui->textBrowser->append("[数据库]     - 可能原因: libmysql.dll 缺少 OpenSSL 依赖（libssl-3-x64.dll / libcrypto-3-x64.dll）");
+        ui->textBrowser->append("[数据库]     - 解决方法: 从 MySQL 安装目录 bin 复制 libssl-3-x64.dll、libcrypto-3-x64.dll 到 exe 同级");
         ui->textBrowser->append("[数据库]     - 解决方法: 确保 qsqlmysql.dll 在 plugins/sqldrivers/ 目录");
     }
 
@@ -331,7 +347,7 @@ MainWindow::MainWindow(QWidget *parent)
         ui->textBrowser->append("[数据库]   2. 端口配置不正确（当前: " + QString::number(dbPort) + "）");
         ui->textBrowser->append("[数据库]   3. 用户凭证错误");
         ui->textBrowser->append("[数据库]   4. 目标数据库不存在");
-        ui->textBrowser->append("[数据库]   5. libmysql.dll 版本不兼容（尝试从MySQL安装目录复制）");
+        ui->textBrowser->append("[数据库]   5. libmysql.dll 缺少 OpenSSL 依赖（需 libssl-3-x64.dll / libcrypto-3-x64.dll 与 exe 同级）");
     }
 
     if (dbManagerInit) {
