@@ -480,18 +480,19 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
         response.write(htmlData, true);
                     return;
                 }
-    // 2. 背景图接口��GET /showimage → �回Qt中选中的背景图��固定尺寸适配��
+    // 2. 背景图接口：GET /showimage → 按客户端 IP 推送绑定背景图
     else if (method == "GET" && path == "/showimage") {
         MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
         if (!mainWindow) {
             response.setStatus(500, "Internal Error");
-            response.write("无法获取�窗口实例", true);
+            response.write("无法获取主窗口实例", true);
             return;
         }
 
-        QString imagePath = mainWindow->getCurrentImagePath();
+        const QString clientIp = MainWindow::normalizeClientIp(request.getPeerAddress().toString());
+        QString imagePath = mainWindow->getImagePathForClientIp(clientIp);
         if (imagePath.isEmpty()) {
-            qDebug() << "[/showimage] 未选择背景图片";
+            qDebug() << "[/showimage] 未选择背景图片, clientIp=" << clientIp;
             response.setStatus(404, "Image Not Found");
             response.write("未选择背景图片", true);
             return;
@@ -499,22 +500,22 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
 
         QFile imageFile(imagePath);
         if (!imageFile.exists()) {
-            qDebug() << "[/showimage] 背景图不存在��" << imagePath;
+            qDebug() << "[/showimage] 背景图不存在：" << imagePath;
             response.setStatus(404, "Image Not Found");
-            response.write(QString("背景图不存在��路径��%1��").arg(imagePath).toUtf8(), true);
+            response.write(QString("背景图不存在：路径：%1").arg(imagePath).toUtf8(), true);
             return;
         }
         if (!imageFile.open(QIODevice::ReadOnly)) {
-            qDebug() << "[/showimage] 图片文�打开失败��" << imageFile.errorString();
+            qDebug() << "[/showimage] 图片文件打开失败：" << imageFile.errorString();
             response.setStatus(500, "Internal Error");
-            response.write(QString("图片文�打开失败��错误��%1��").arg(imageFile.errorString()).toUtf8(), true);
+            response.write(QString("图片文件打开失败：错误：%1").arg(imageFile.errorString()).toUtf8(), true);
             return;
         }
 
         QByteArray imageData = imageFile.readAll();
         imageFile.close();
 
-        // 根据文�后缀设置Content-Type��适配常见图片格式��
+        // 根据文件后缀设置Content-Type
         QString suffix = QFileInfo(imagePath).suffix().toLower();
         QString contentType = "image/jpeg";
         if (suffix == "png") contentType = "image/png";
@@ -524,7 +525,7 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
 
         response.setHeader("Content-Type", contentType.toUtf8());
         response.setHeader("Content-Length", QString::number(imageData.size()).toUtf8());
-        // 强制图片按固定尺寸显示��前端已设置object-fit: cover��
+        response.setHeader("X-Display-Client-Ip", clientIp.toUtf8());
         response.write(imageData, true);
         return;
     }
@@ -557,37 +558,40 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
     }
 
                     // 4. 图片�息接口��GET /currentImageInfo → �回固定适配尺寸�息
-                    else if (method == "GET" && path == "/currentImageInfo") {
+else if (method == "GET" && path == "/currentImageInfo") {
                         MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
                         if (!mainWindow) {
                             response.setStatus(500, "Internal Error");
-                            response.write("无法获取�窗口实例", true);
+                            response.write("MainWindow unavailable", true);
                             return;
                         }
 
-                        QString imagePath = mainWindow->getCurrentImagePath();
+                        const QString clientIp = MainWindow::normalizeClientIp(request.getPeerAddress().toString());
+                        QString imagePath = mainWindow->getImagePathForClientIp(clientIp);
                         QJsonObject imageObj;
                         QString absPath = QFileInfo(imagePath).absoluteFilePath();
 
                         if (imagePath.isEmpty()) {
                             imageObj["exists"] = false;
-                            imageObj["message"] = "未选择背景图片";
-                            imageObj["timestamp"] = 0; // 时间戳��0表示无图片
+                            imageObj["message"] = QStringLiteral("未选择背景图片");
+                            imageObj["timestamp"] = 0;
                         } else {
                             QPixmap pixmap(imagePath);
                             if (pixmap.isNull()) {
                                 imageObj["exists"] = false;
-                                imageObj["message"] = "图片加载失败";
+                                imageObj["message"] = QStringLiteral("图片加载失败");
                                 imageObj["timestamp"] = 0;
                             } else {
                                 imageObj["exists"] = true;
-                                imageObj["path"] = absPath; // �回�对路径��确�一致性
-                                imageObj["timestamp"] = mainWindow->getCurrentImageTimestamp(); // 关键��图片�改时间戳
+                                imageObj["path"] = absPath;
+                                imageObj["timestamp"] = mainWindow->getImageTimestampForClientIp(clientIp);
                                 imageObj["originalWidth"] = pixmap.width();
                                 imageObj["originalHeight"] = pixmap.height();
                                 imageObj["adaptedWidth"] = 1850;
                                 imageObj["adaptedHeight"] = 750;
                                 imageObj["fileName"] = QFileInfo(imagePath).fileName();
+                                imageObj["clientIp"] = clientIp;
+                                imageObj["imageIndex"] = mainWindow->resolveImageIndexForClientIp(clientIp);
                             }
                         }
 
@@ -596,17 +600,16 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
                         return;
                     }
 
-                       // 5. 设备列表接口��GET /currentDevices → �回设备列表��基于固定尺寸点位��
                     else if (method == "GET" && path == "/currentDevices") {
                             MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
                             if (!mainWindow) {
                                 response.setStatus(500, "Internal Error");
-                                response.write("无法获取�窗口实例", true);
+                                response.write("MainWindow unavailable", true);
                                 return;
                             }
 
-                            // 调用新增接口��获取当前图片的设备列表
-                            QList<QJsonObject> devicesData = mainWindow->getCurrentImageDevices();
+                            const QString clientIp = MainWindow::normalizeClientIp(request.getPeerAddress().toString());
+                            QList<QJsonObject> devicesData = mainWindow->getImageDevicesForClientIp(clientIp);
                             QJsonArray devicesArray;
                             for (const QJsonObject& devObj : devicesData) {
                                 devicesArray.append(devObj);
@@ -615,15 +618,19 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
                             QJsonObject responseObj;
                             responseObj["count"] = devicesArray.size();
                             responseObj["devices"] = devicesArray;
-                            responseObj["currentImagePath"] = mainWindow->getCurrentImagePath();
-                            responseObj["message"] = devicesArray.isEmpty() ? "当前图片暂无�定设备" : "成功获取当前图片设备";
+                            responseObj["currentImagePath"] = mainWindow->getImagePathForClientIp(clientIp);
+                            responseObj["clientIp"] = clientIp;
+                            responseObj["imageIndex"] = mainWindow->resolveImageIndexForClientIp(clientIp);
+                            responseObj["message"] = devicesArray.isEmpty()
+                                ? QStringLiteral("当前图片暂无绑定设备")
+                                : QStringLiteral("成功获取当前图片设备");
 
                             response.setHeader("Content-Type", "application/json; charset=utf-8");
                             response.write(QJsonDocument(responseObj).toJson(QJsonDocument::Compact), true);
                             return;
                         }
 
-                        // 6. 报警处理记录接口��POST /api/alarm-handling → 存储报警处理记录
+                        // 6. alarm-handling
                         else if (method == "POST" && path == "/api/alarm-handling") {
                             // 解析请求体
                             QByteArray requestBody = request.getBody();
@@ -861,7 +868,15 @@ void MyRequestHandler::service(HttpRequest& request, HttpResponse& response)
                        // 9. �题API��GET /api/theme → �回当前�题
                        else if (method == "GET" && path == "/api/theme") {
                            QJsonObject themeObj;
-                           themeObj["theme"] = currentTheme;
+                           MainWindow* mainWindow = qobject_cast<MainWindow*>(this->parent());
+                           const QString clientIp = MainWindow::normalizeClientIp(request.getPeerAddress().toString());
+                           if (mainWindow) {
+                               themeObj["theme"] = mainWindow->getImageThemeForClientIp(clientIp);
+                               themeObj["clientIp"] = clientIp;
+                               themeObj["imageIndex"] = mainWindow->resolveImageIndexForClientIp(clientIp);
+                           } else {
+                               themeObj["theme"] = currentTheme;
+                           }
                            themeObj["separateEnvEsd"] = m_separateEnvEsd;
                            QJsonDocument doc(themeObj);
                            response.setHeader("Content-Type", "application/json; charset=utf-8");

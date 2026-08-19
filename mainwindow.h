@@ -187,6 +187,13 @@ public:
     void setImageDevices(const QString& imagePath, const QList<QJsonObject>& devices);
     QList<QJsonObject> getCurrentImageDevices();
     qint64 getCurrentImageTimestamp();
+    /** 按浏览器客户端 IP 解析应推送的背景图索引；未登记则回退当前选中图 */
+    int resolveImageIndexForClientIp(const QString& clientIp) const;
+    QString getImagePathForClientIp(const QString& clientIp) const;
+    QString getImageThemeForClientIp(const QString& clientIp) const;
+    QList<QJsonObject> getImageDevicesForClientIp(const QString& clientIp);
+    qint64 getImageTimestampForClientIp(const QString& clientIp) const;
+    static QString normalizeClientIp(const QString& rawIp);
     QMap<QString, QStringList> getAddressFuncData();
     MainWindow(QWidget *parent = nullptr);
     MyRequestHandler* requestHandler;
@@ -389,7 +396,7 @@ private:
     void addImageToHistory(const QString& imagePath); // 添加图片到历史列表
     void switchToImage(int index); // 切换到指定图片
     void setImageTheme(const QString& imagePath, const QString& theme); // 设置图片主题
-    int findImageIndex(const QString& imagePath); // 查找图片在列表中的索引
+    int findImageIndex(const QString& imagePath) const; // 查找图片在列表中的索引
     void clearCurrentDevices(); // 隐藏所有图片的设备点
     void applyGlobalUiStyle();
     void applyConnectionSettingsStyle();
@@ -403,6 +410,7 @@ private:
     void onEsdEditFrameSend(const QByteArray& frame, const QString& expectedFunc);
     void updateMapPageToolbarsPosition(); // 将地图页工具栏定位到地图下方
     bool m_separateEnvEsd = true;
+    QList<DisplayScreenConfig> m_displayScreens; // 显示机 IP → 背景图
 
     QVector<QStringList> getPollConfigRows();
     QSet<QString> collectPlacedDeviceIds() const;
@@ -433,6 +441,9 @@ private:
     void saveSerialConfig();  // 保存串口配置
     void loadSerialConfig();  // 加载串口配置
     void autoConnect();       // 自动连接串口并启动轮询
+    QList<QJsonObject> getImageDevicesByIndex(int imageIndex) const;
+    qint64 getImageTimestampByIndex(int imageIndex) const;
+    void pruneDisplayScreensForMissingImages();
 
     // 原有函数声明不变...
     uint16_t calcrc(const QByteArray &data) const;
@@ -492,6 +503,7 @@ private slots:
     void onBtnApplyThemeClicked();
     void onChkSeparateEnvEsdChanged(int state);
     void onBtnSaveDevicePositionsClicked();
+    void onBtnDisplayScreensClicked();
     void onConnectionTypeChanged(int index);
     void onSerialModeChanged(int index);
     void updateSerialPortVisibility();

@@ -11,7 +11,8 @@ configmanager::configmanager(QObject *parent) : QObject(parent)
 
 // 保存配置到JSON文件
 bool configmanager::saveConfig(const QList<ImageConfig>& imageConfigs, int currentImageIndex,
-                               const SerialConfig& serialConfig, bool separateEnvEsd)
+                               const SerialConfig& serialConfig, bool separateEnvEsd,
+                               const QList<DisplayScreenConfig>& displayScreens)
 {
     QJsonObject rootObj;
 
@@ -56,7 +57,32 @@ bool configmanager::saveConfig(const QList<ImageConfig>& imageConfigs, int curre
     rootObj["serialConfig"] = serialObj;
     rootObj["separateEnvEsd"] = separateEnvEsd;
 
-    // 4. 写入文件
+    // 4. 保存显示屏 IP → 背景图映射（支持多图轮换）
+    QJsonArray screenArray;
+    for (const DisplayScreenConfig& screen : displayScreens) {
+        if (screen.ip.trimmed().isEmpty()) {
+            continue;
+        }
+        QJsonObject screenObj;
+        screenObj["name"] = screen.name;
+        screenObj["ip"] = screen.ip.trimmed();
+        QJsonArray pathsArr;
+        for (const QString& p : screen.imagePaths) {
+            if (!p.trimmed().isEmpty()) {
+                pathsArr.append(p);
+            }
+        }
+        screenObj["imagePaths"] = pathsArr;
+        // 兼容旧版单字段
+        if (!screen.imagePaths.isEmpty()) {
+            screenObj["imagePath"] = screen.imagePaths.first();
+        }
+        screenObj["switchSeconds"] = screen.switchSeconds > 0 ? screen.switchSeconds : 10;
+        screenArray.append(screenObj);
+    }
+    rootObj["displayScreens"] = screenArray;
+
+    // 5. 写入文件
     QFile file(m_configPath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         qDebug() << "[ConfigManager] 保存配置失败：无法打开文件" << file.errorString();
@@ -67,16 +93,19 @@ bool configmanager::saveConfig(const QList<ImageConfig>& imageConfigs, int curre
     file.write(doc.toJson(QJsonDocument::Indented)); // 格式化输出，方便查看
     file.close();
     qDebug() << "[ConfigManager] 配置保存成功！图片数量:" << imageConfigs.size()
-             << "，当前选中索引:" << currentImageIndex;
+             << "，当前选中索引:" << currentImageIndex
+             << "，显示屏映射:" << screenArray.size();
     return true;
 }
 
 // 从JSON文件读取配置
 bool configmanager::loadConfig(QList<ImageConfig>& imageConfigs, int& currentImageIndex,
-                               SerialConfig& serialConfig, bool& separateEnvEsd)
+                               SerialConfig& serialConfig, bool& separateEnvEsd,
+                               QList<DisplayScreenConfig>& displayScreens)
 {
     // 清空原有数据
     imageConfigs.clear();
+    displayScreens.clear();
     currentImageIndex = -1;
 
     // 检查文件是否存在
@@ -149,7 +178,48 @@ bool configmanager::loadConfig(QList<ImageConfig>& imageConfigs, int& currentIma
         ? rootObj["separateEnvEsd"].toBool(true)
         : true;
 
+    // 4. 读取显示屏映射
+    if (rootObj.contains("displayScreens")) {
+        QJsonArray screenArray = rootObj["displayScreens"].toArray();
+        for (const QJsonValue& screenVal : screenArray) {
+            QJsonObject screenObj = screenVal.toObject();
+            DisplayScreenConfig screen;
+            screen.name = screenObj["name"].toString();
+            screen.ip = screenObj["ip"].toString().trimmed();
+            screen.switchSeconds = screenObj["switchSeconds"].toInt(10);
+            if (screen.switchSeconds <= 0) {
+                screen.switchSeconds = 10;
+            }
+
+            if (screenObj.contains("imagePaths") && screenObj["imagePaths"].isArray()) {
+                for (const QJsonValue& pv : screenObj["imagePaths"].toArray()) {
+                    const QString path = pv.toString().trimmed();
+                    if (!path.isEmpty()) {
+                        screen.imagePaths.append(path);
+                    }
+                }
+            }
+            // 兼容旧字段 imagePath / imageIndex
+            if (screen.imagePaths.isEmpty()) {
+                const QString single = screenObj["imagePath"].toString().trimmed();
+                if (!single.isEmpty()) {
+                    screen.imagePaths.append(single);
+                } else if (screenObj.contains("imageIndex")) {
+                    const int idx = screenObj["imageIndex"].toInt(-1);
+                    if (idx >= 0 && idx < imageConfigs.size()) {
+                        screen.imagePaths.append(imageConfigs[idx].imagePath);
+                    }
+                }
+            }
+
+            if (!screen.ip.isEmpty() && !screen.imagePaths.isEmpty()) {
+                displayScreens.append(screen);
+            }
+        }
+    }
+
     qDebug() << "[ConfigManager] 配置读取成功！加载图片数量:" << imageConfigs.size()
-             << "，上次选中索引:" << currentImageIndex;
+             << "，上次选中索引:" << currentImageIndex
+             << "，显示屏映射:" << displayScreens.size();
     return true;
 }

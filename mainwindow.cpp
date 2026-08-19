@@ -13,6 +13,14 @@
 #include <QProcess>
 #include <QSqlDatabase>
 #include <QDir>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QComboBox>
+#include <QPushButton>
+#include <QAbstractItemView>
+#include <QListWidget>
+#include <QSpinBox>
+#include <QDateTime>
 #include <algorithm>
 
 MainWindow::MainWindow(QWidget *parent)
@@ -399,6 +407,13 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->chkSeparateEnvEsd, &QCheckBox::stateChanged, this, &MainWindow::onChkSeparateEnvEsdChanged);
     connect(ui->btnSaveDevicePositions, &QPushButton::clicked, this, &MainWindow::onBtnSaveDevicePositionsClicked);
     connect(ui->pushButton_4, &QPushButton::clicked, this, &MainWindow::onPushButton4Clicked);
+    // 地图页工具栏增加「显示屏设置」
+    if (ui->horizontalLayout_131) {
+        QPushButton *btnDisplayScreens = new QPushButton(QStringLiteral("显示屏设置"), this);
+        btnDisplayScreens->setObjectName(QStringLiteral("btnDisplayScreens"));
+        ui->horizontalLayout_131->addWidget(btnDisplayScreens);
+        connect(btnDisplayScreens, &QPushButton::clicked, this, &MainWindow::onBtnDisplayScreensClicked);
+    }
     // 新增：连接pushButton_5点击信号
     connect(ui->pushButton_5, &QPushButton::clicked, this, &MainWindow::onPushButton5Clicked);
     // 连接pushButton_6点击信号
@@ -1011,13 +1026,15 @@ void MainWindow::restoreFromConfig()
     int savedCurrentIndex = -1;
     SerialConfig serialConfig;
     bool separateEnvEsd = true;
+    QList<DisplayScreenConfig> displayScreens;
 
-    bool loadSuccess = m_configManager->loadConfig(imageConfigs, savedCurrentIndex, serialConfig, separateEnvEsd);
+    bool loadSuccess = m_configManager->loadConfig(imageConfigs, savedCurrentIndex, serialConfig, separateEnvEsd, displayScreens);
     if (!loadSuccess) {
         writeCrashLog("[Config] 配置文件读取失败或不存在，启动默认配置");
         return;
     }
 
+    m_displayScreens = displayScreens;
     m_separateEnvEsd = separateEnvEsd;
     if (ui->chkSeparateEnvEsd) {
         ui->chkSeparateEnvEsd->blockSignals(true);
@@ -1153,6 +1170,7 @@ void MainWindow::restoreFromConfig()
     onSerialModeChanged(ui->comboBox_serial_mode->currentIndex());
 
     writeCrashLog("[Config] 串口配置加载成功");
+    writeCrashLog(QStringLiteral("[Config] 显示屏映射加载：%1 条").arg(m_displayScreens.size()));
 
     // 自动连接串口并启动轮询
     QTimer::singleShot(100, this, &MainWindow::autoConnect);
@@ -1201,10 +1219,10 @@ void MainWindow::saveToConfig()
     serialConfig.tcpServerIp = ui->lineEdit_tcp_server_ip->text(); // TCP Server IP地址
     serialConfig.tcpServerPort = ui->lineEdit_tcp_server_port->text(); // TCP Server 端口
 
-    bool saveSuccess = m_configManager->saveConfig(imageConfigs, m_currentImageIndex, serialConfig, m_separateEnvEsd);
+    bool saveSuccess = m_configManager->saveConfig(imageConfigs, m_currentImageIndex, serialConfig, m_separateEnvEsd, m_displayScreens);
     if (saveSuccess) {
-        writeCrashLog(QString("[Config] 配置保存成功：图片数=%1，当前选中索引=%2")
-                     .arg(imageConfigs.size()).arg(m_currentImageIndex));
+        writeCrashLog(QString("[Config] 配置保存成功：图片数=%1，当前选中索引=%2，显示屏=%3")
+                     .arg(imageConfigs.size()).arg(m_currentImageIndex).arg(m_displayScreens.size()));
     } else {
         writeCrashLog("[Config] 配置保存失败！");
     }
@@ -2941,10 +2959,12 @@ void MainWindow::switchToImage(int index)
     updateMapPageToolbarsPosition();
 }
 // 查找图片在列表中的索引（根据路径）
-int MainWindow::findImageIndex(const QString& imagePath)
+int MainWindow::findImageIndex(const QString& imagePath) const
 {
+    const QString absWanted = QFileInfo(imagePath).absoluteFilePath();
     for (int i = 0; i < m_imageDeviceList.size(); ++i) {
-        if (m_imageDeviceList[i].imagePath == imagePath) {
+        if (m_imageDeviceList[i].imagePath == imagePath
+            || QFileInfo(m_imageDeviceList[i].imagePath).absoluteFilePath() == absWanted) {
             return i;
         }
     }
@@ -3240,6 +3260,7 @@ void MainWindow::onBtnDeleteClicked()
 
     // 移除图片数据
     m_imageDeviceList.removeAt(m_currentImageIndex);
+    pruneDisplayScreensForMissingImages();
 
     // 更新下拉列表
     if (ui->cmbImageList) {
@@ -3491,6 +3512,333 @@ qint64 MainWindow::getCurrentImageTimestamp()
     QString imagePath = m_imageDeviceList[m_currentImageIndex].imagePath;
     return QFileInfo(imagePath).lastModified().toMSecsSinceEpoch();
 }
+
+QString MainWindow::normalizeClientIp(const QString& rawIp)
+{
+    QString ip = rawIp.trimmed();
+    if (ip.startsWith(QStringLiteral("::ffff:"), Qt::CaseInsensitive)) {
+        ip = ip.mid(7);
+    }
+    if (ip == QStringLiteral("::1") || ip.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0) {
+        return QStringLiteral("127.0.0.1");
+    }
+    // 去掉可能的端口（极少见）
+    if (ip.contains(QLatin1Char('%'))) {
+        ip = ip.section(QLatin1Char('%'), 0, 0);
+    }
+    return ip;
+}
+
+int MainWindow::resolveImageIndexForClientIp(const QString& clientIp) const
+{
+    const QString ip = normalizeClientIp(clientIp);
+    if (!ip.isEmpty()) {
+        for (const DisplayScreenConfig& screen : m_displayScreens) {
+            if (normalizeClientIp(screen.ip) != ip) {
+                continue;
+            }
+
+            QList<int> validIndices;
+            for (const QString& path : screen.imagePaths) {
+                const int idx = findImageIndex(path);
+                if (idx >= 0) {
+                    validIndices.append(idx);
+                }
+            }
+            if (validIndices.isEmpty()) {
+                break;
+            }
+            if (validIndices.size() == 1) {
+                return validIndices.first();
+            }
+
+            const int interval = screen.switchSeconds > 0 ? screen.switchSeconds : 10;
+            const qint64 slot = QDateTime::currentSecsSinceEpoch() / interval;
+            const int rot = static_cast<int>(slot % validIndices.size());
+            return validIndices.at(rot);
+        }
+    }
+    // 未登记或图片已删除：回退主界面当前选中图
+    if (m_currentImageIndex >= 0 && m_currentImageIndex < m_imageDeviceList.size()) {
+        return m_currentImageIndex;
+    }
+    return m_imageDeviceList.isEmpty() ? -1 : 0;
+}
+
+QString MainWindow::getImagePathForClientIp(const QString& clientIp) const
+{
+    const int idx = resolveImageIndexForClientIp(clientIp);
+    if (idx < 0 || idx >= m_imageDeviceList.size()) {
+        return QString();
+    }
+    return m_imageDeviceList[idx].imagePath;
+}
+
+QString MainWindow::getImageThemeForClientIp(const QString& clientIp) const
+{
+    const int idx = resolveImageIndexForClientIp(clientIp);
+    if (idx < 0 || idx >= m_imageDeviceList.size()) {
+        return QStringLiteral("静电管理在线监控系统 ESD-1000.V1.0");
+    }
+    const QString& theme = m_imageDeviceList[idx].theme;
+    return theme.isEmpty() ? QStringLiteral("静电管理在线监控系统 ESD-1000.V1.0") : theme;
+}
+
+QList<QJsonObject> MainWindow::getImageDevicesByIndex(int imageIndex) const
+{
+    QList<QJsonObject> devicesJson;
+    if (imageIndex < 0 || imageIndex >= m_imageDeviceList.size()) {
+        return devicesJson;
+    }
+
+    const ImageDeviceData& currentImgData = m_imageDeviceList[imageIndex];
+    QPixmap originalPixmap(currentImgData.imagePath);
+    int imgWidth = originalPixmap.width();
+    int imgHeight = originalPixmap.height();
+    if (imgWidth <= 0 || imgHeight <= 0) {
+        imgWidth = 1280;
+        imgHeight = 720;
+    }
+
+    for (DeviceWidget* dev : currentImgData.devices) {
+        if (!dev) continue;
+        QJsonObject devObj;
+        devObj["id"] = dev->getId();
+        devObj["type"] = dev->getType();
+        const int absoluteX = dev->getPos().x();
+        const int absoluteY = dev->getPos().y();
+        const double relativeX = (static_cast<double>(absoluteX) / imgWidth) * 100;
+        const double relativeY = (static_cast<double>(absoluteY) / imgHeight) * 100;
+        devObj["x"] = QString::number(relativeX, 'f', 1);
+        devObj["y"] = QString::number(relativeY, 'f', 1);
+        devicesJson.append(devObj);
+    }
+    return devicesJson;
+}
+
+QList<QJsonObject> MainWindow::getImageDevicesForClientIp(const QString& clientIp)
+{
+    return getImageDevicesByIndex(resolveImageIndexForClientIp(clientIp));
+}
+
+qint64 MainWindow::getImageTimestampByIndex(int imageIndex) const
+{
+    if (imageIndex < 0 || imageIndex >= m_imageDeviceList.size()) {
+        return 0;
+    }
+    return QFileInfo(m_imageDeviceList[imageIndex].imagePath).lastModified().toMSecsSinceEpoch();
+}
+
+qint64 MainWindow::getImageTimestampForClientIp(const QString& clientIp) const
+{
+    const int idx = resolveImageIndexForClientIp(clientIp);
+    const qint64 fileTs = getImageTimestampByIndex(idx);
+    // 叠加入轮换槽位，保证多图切换时前端一定检测到变化
+    const QString ip = normalizeClientIp(clientIp);
+    int interval = 10;
+    for (const DisplayScreenConfig& screen : m_displayScreens) {
+        if (normalizeClientIp(screen.ip) == ip) {
+            interval = screen.switchSeconds > 0 ? screen.switchSeconds : 10;
+            break;
+        }
+    }
+    const qint64 slot = QDateTime::currentSecsSinceEpoch() / interval;
+    return fileTs + slot * 1000000000LL + (idx + 1);
+}
+
+void MainWindow::pruneDisplayScreensForMissingImages()
+{
+    QList<DisplayScreenConfig> kept;
+    for (DisplayScreenConfig screen : m_displayScreens) {
+        QStringList validPaths;
+        for (const QString& path : screen.imagePaths) {
+            if (findImageIndex(path) >= 0) {
+                validPaths.append(path);
+            }
+        }
+        if (!validPaths.isEmpty()) {
+            screen.imagePaths = validPaths;
+            kept.append(screen);
+        }
+    }
+    m_displayScreens = kept;
+}
+
+void MainWindow::onBtnDisplayScreensClicked()
+{
+    if (m_imageDeviceList.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("提示"),
+                             QStringLiteral("请先添加背景图片，再配置显示屏映射。"));
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("显示屏设置（IP → 背景图轮换）"));
+    dlg.resize(860, 480);
+
+    QVBoxLayout *root = new QVBoxLayout(&dlg);
+    QLabel *hint = new QLabel(
+        QStringLiteral("显示机浏览器访问 http://本机IP:1388 时，按对方 IP 推送对应背景图及点位。\n"
+                       "同一显示屏可勾选多张背景图，并设置切换间隔（秒）；只勾选一张则不轮换。\n"
+                       "未登记的 IP 将显示主界面当前选中的背景图。"),
+        &dlg);
+    hint->setWordWrap(true);
+    root->addWidget(hint);
+
+    QTableWidget *table = new QTableWidget(&dlg);
+    table->setColumnCount(4);
+    table->setHorizontalHeaderLabels({
+        QStringLiteral("名称"),
+        QStringLiteral("显示机IP"),
+        QStringLiteral("背景图（可多选）"),
+        QStringLiteral("切换秒数")
+    });
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->verticalHeader()->setDefaultSectionSize(110);
+    root->addWidget(table);
+
+    auto makeImageList = [this](const QStringList& selectedPaths) -> QListWidget* {
+        QListWidget *list = new QListWidget();
+        list->setMinimumHeight(90);
+        for (int i = 0; i < m_imageDeviceList.size(); ++i) {
+            const QString path = m_imageDeviceList[i].imagePath;
+            const QString name = QFileInfo(path).fileName();
+            QListWidgetItem *item = new QListWidgetItem(
+                QStringLiteral("%1 — %2").arg(i + 1).arg(name), list);
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setData(Qt::UserRole, path);
+            bool checked = false;
+            const QString absPath = QFileInfo(path).absoluteFilePath();
+            for (const QString& sel : selectedPaths) {
+                if (sel == path || QFileInfo(sel).absoluteFilePath() == absPath) {
+                    checked = true;
+                    break;
+                }
+            }
+            item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+        }
+        return list;
+    };
+
+    auto addRow = [&](const DisplayScreenConfig& screen) {
+        const int row = table->rowCount();
+        table->insertRow(row);
+        table->setItem(row, 0, new QTableWidgetItem(screen.name));
+        table->setItem(row, 1, new QTableWidgetItem(screen.ip));
+        table->setCellWidget(row, 2, makeImageList(screen.imagePaths));
+        QSpinBox *spin = new QSpinBox(table);
+        spin->setRange(1, 3600);
+        spin->setValue(screen.switchSeconds > 0 ? screen.switchSeconds : 10);
+        spin->setSuffix(QStringLiteral(" 秒"));
+        table->setCellWidget(row, 3, spin);
+    };
+
+    for (const DisplayScreenConfig& screen : m_displayScreens) {
+        addRow(screen);
+    }
+    if (table->rowCount() == 0) {
+        DisplayScreenConfig empty;
+        empty.name = QStringLiteral("显示屏1");
+        empty.ip = QStringLiteral("192.168.1.101");
+        empty.switchSeconds = 10;
+        if (!m_imageDeviceList.isEmpty()) {
+            empty.imagePaths << m_imageDeviceList[0].imagePath;
+        }
+        addRow(empty);
+    }
+
+    QHBoxLayout *btnRow = new QHBoxLayout();
+    QPushButton *btnAdd = new QPushButton(QStringLiteral("添加"), &dlg);
+    QPushButton *btnRemove = new QPushButton(QStringLiteral("删除选中"), &dlg);
+    QPushButton *btnOk = new QPushButton(QStringLiteral("保存"), &dlg);
+    QPushButton *btnCancel = new QPushButton(QStringLiteral("取消"), &dlg);
+    btnRow->addWidget(btnAdd);
+    btnRow->addWidget(btnRemove);
+    btnRow->addStretch();
+    btnRow->addWidget(btnOk);
+    btnRow->addWidget(btnCancel);
+    root->addLayout(btnRow);
+
+    connect(btnAdd, &QPushButton::clicked, &dlg, [&]() {
+        DisplayScreenConfig screen;
+        screen.name = QStringLiteral("显示屏%1").arg(table->rowCount() + 1);
+        screen.ip.clear();
+        screen.switchSeconds = 10;
+        if (!m_imageDeviceList.isEmpty()) {
+            screen.imagePaths << m_imageDeviceList[0].imagePath;
+        }
+        addRow(screen);
+    });
+    connect(btnRemove, &QPushButton::clicked, &dlg, [&]() {
+        const int row = table->currentRow();
+        if (row >= 0) {
+            table->removeRow(row);
+        }
+    });
+    connect(btnCancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+    connect(btnOk, &QPushButton::clicked, &dlg, [&]() {
+        QList<DisplayScreenConfig> screens;
+        QSet<QString> usedIps;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            DisplayScreenConfig screen;
+            screen.name = table->item(row, 0) ? table->item(row, 0)->text().trimmed() : QString();
+            screen.ip = table->item(row, 1) ? table->item(row, 1)->text().trimmed() : QString();
+            QListWidget *list = qobject_cast<QListWidget*>(table->cellWidget(row, 2));
+            QSpinBox *spin = qobject_cast<QSpinBox*>(table->cellWidget(row, 3));
+            screen.switchSeconds = spin ? spin->value() : 10;
+            if (list) {
+                for (int i = 0; i < list->count(); ++i) {
+                    QListWidgetItem *item = list->item(i);
+                    if (item && item->checkState() == Qt::Checked) {
+                        screen.imagePaths.append(item->data(Qt::UserRole).toString());
+                    }
+                }
+            }
+
+            if (screen.ip.isEmpty()) {
+                QMessageBox::warning(&dlg, QStringLiteral("提示"),
+                                     QStringLiteral("第 %1 行 IP 不能为空").arg(row + 1));
+                return;
+            }
+            QHostAddress addr(screen.ip);
+            if (addr.isNull()) {
+                QMessageBox::warning(&dlg, QStringLiteral("提示"),
+                                     QStringLiteral("第 %1 行 IP 格式无效：%2").arg(row + 1).arg(screen.ip));
+                return;
+            }
+            const QString norm = normalizeClientIp(screen.ip);
+            if (usedIps.contains(norm)) {
+                QMessageBox::warning(&dlg, QStringLiteral("提示"),
+                                     QStringLiteral("IP 重复：%1").arg(screen.ip));
+                return;
+            }
+            usedIps.insert(norm);
+            screen.ip = norm;
+            if (screen.imagePaths.isEmpty()) {
+                QMessageBox::warning(&dlg, QStringLiteral("提示"),
+                                     QStringLiteral("第 %1 行请至少勾选一张背景图").arg(row + 1));
+                return;
+            }
+            screens.append(screen);
+        }
+        m_displayScreens = screens;
+        saveToConfig();
+        writeCrashLog(QStringLiteral("[DisplayScreen] 已保存 %1 条显示屏映射（支持多图轮换）")
+                          .arg(m_displayScreens.size()));
+        QMessageBox::information(&dlg, QStringLiteral("成功"),
+                                 QStringLiteral("显示屏映射已保存。\n"
+                                                "多图时按设定秒数自动轮换；显示机浏览器打开 http://本机IP:1388 即可。"));
+        dlg.accept();
+    });
+
+    dlg.exec();
+}
+
 // 控制图片自动循环的启动/停止
 void MainWindow::onPushButton4Clicked()
 {

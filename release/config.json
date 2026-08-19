@@ -1,65 +1,82 @@
 {
     "currentImageIndex": 0,
+    "displayScreens": [
+        {
+            "imagePath": "C:/Users/admin/Desktop/85a32ed9-7b8c-42b2-8cf5-4567af528175.png",
+            "imagePaths": [
+                "C:/Users/admin/Desktop/85a32ed9-7b8c-42b2-8cf5-4567af528175.png"
+            ],
+            "ip": "192.168.0.199",
+            "name": "显示屏1",
+            "switchSeconds": 10
+        }
+    ],
     "images": [
         {
             "devices": [
                 {
-                    "id": "W1-1",
-                    "type": "W",
+                    "id": "E1-1",
+                    "type": "E",
                     "x": 46,
                     "y": 56
                 },
                 {
-                    "id": "T1-1",
-                    "type": "T",
+                    "id": "E1-2",
+                    "type": "E",
                     "x": 98,
                     "y": 56
                 },
                 {
-                    "id": "W2-1",
-                    "type": "W",
+                    "id": "E1-3",
+                    "type": "E",
                     "x": 150,
                     "y": 56
                 },
                 {
-                    "id": "T2-1",
-                    "type": "T",
+                    "id": "E1-4",
+                    "type": "E",
                     "x": 202,
                     "y": 56
-                },
-                {
-                    "id": "E2001-1",
-                    "type": "E",
-                    "x": 254,
-                    "y": 56
-                },
-                {
-                    "id": "E2001-2",
-                    "type": "E",
-                    "x": 306,
-                    "y": 56
-                },
-                {
-                    "id": "E2001-3",
-                    "type": "E",
-                    "x": 358,
-                    "y": 56
-                },
-                {
-                    "id": "E2001-4",
-                    "type": "E",
-                    "x": 502,
-                    "y": 20
                 }
             ],
-            "imagePath": "C:/Users/Ellen/Desktop/F6576053-3E4D-3131-B234-54110CD8DCB7.png",
+            "imagePath": "C:/Users/admin/Desktop/84b093f5-c857-436a-a301-b11f591ace31.png",
+            "theme": "静电管理在线监控系统 ESD-1000.V1.0"
+        },
+        {
+            "devices": [
+                {
+                    "id": "E1-5",
+                    "type": "E",
+                    "x": 46,
+                    "y": 56
+                },
+                {
+                    "id": "E1-6",
+                    "type": "E",
+                    "x": 98,
+                    "y": 56
+                },
+                {
+                    "id": "E1-7",
+                    "type": "E",
+                    "x": 150,
+                    "y": 56
+                },
+                {
+                    "id": "E1-8",
+                    "type": "E",
+                    "x": 202,
+                    "y": 56
+                }
+            ],
+            "imagePath": "C:/Users/admin/Desktop/85a32ed9-7b8c-42b2-8cf5-4567af528175.png",
             "theme": "静电管理在线监控系统 ESD-1000.V1.0"
         }
     ],
     "separateEnvEsd": false,
     "serialConfig": {
-        "baudRate": "4800",
-        "connectionType": 1,
+        "baudRate": "9600",
+        "connectionType": 0,
         "delay": "100",
         "maxResend": "2",
         "overtime": "200",

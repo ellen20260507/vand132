@@ -40,19 +40,29 @@ struct ImageConfig {
     QList<DeviceConfig> devices; // 该图片对应的所有设备
 };
 
+// 显示屏映射：客户端 IP → 一张或多张背景图（多张时按间隔轮换）
+struct DisplayScreenConfig {
+    QString name;              // 备注名称（如「二楼大屏」）
+    QString ip;                // 显示机固定 IP
+    QStringList imagePaths;    // 绑定的背景图路径（可多张轮换）
+    int switchSeconds = 10;    // 多图轮换间隔（秒），仅 1 张时忽略
+};
+
 class configmanager : public QObject
 {
     Q_OBJECT
 public:
     explicit configmanager(QObject *parent = nullptr);
 
-    // 保存配置（图片列表+所有设备+当前选中索引+串口参数+显示模式）
+    // 保存配置（图片列表+所有设备+当前选中索引+串口参数+显示模式+显示屏映射）
     bool saveConfig(const QList<ImageConfig>& imageConfigs, int currentImageIndex,
-                    const SerialConfig& serialConfig, bool separateEnvEsd = true);
+                    const SerialConfig& serialConfig, bool separateEnvEsd = true,
+                    const QList<DisplayScreenConfig>& displayScreens = QList<DisplayScreenConfig>());
 
-    // 读取配置（返回图片列表+上次选中的图片索引+串口参数+显示模式）
+    // 读取配置（返回图片列表+上次选中的图片索引+串口参数+显示模式+显示屏映射）
     bool loadConfig(QList<ImageConfig>& imageConfigs, int& currentImageIndex,
-                    SerialConfig& serialConfig, bool& separateEnvEsd);
+                    SerialConfig& serialConfig, bool& separateEnvEsd,
+                    QList<DisplayScreenConfig>& displayScreens);
 
 private:
     QString m_configPath; // 配置文件路径（exe同目录/config.json）
